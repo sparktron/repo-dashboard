@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Repo Dashboard</title>
+<style>
+:root {
+  color-scheme: light;
+  --surface-1:  #fcfcfb;
+  --plane:      #f9f9f7;
+  --ink-1:      #0b0b0b;
+  --ink-2:      #52514e;
+  --ink-3:      #898781;
+  --grid:       #e1e0d9;
+  --rule:       #c3c2b7;
+  --border:     rgba(11,11,11,0.10);
+  --wash:       rgba(11,11,11,0.035);
+  --good:       #0ca30c;
+  --warning:    #fab219;
+  --serious:    #ec835a;
+  --critical:   #d03b3b;
+  --accent:     #2a78d6;
+  --radius: 8px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --surface-1: #1a1a19;
+    --plane:     #0d0d0d;
+    --ink-1:     #ffffff;
+    --ink-2:     #c3c2b7;
+    --ink-3:     #898781;
+    --grid:      #2c2c2a;
+    --rule:      #383835;
+    --border:    rgba(255,255,255,0.10);
+    --wash:      rgba(255,255,255,0.045);
+    --accent:    #3987e5;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-1: #1a1a19;
+  --plane:     #0d0d0d;
+  --ink-1:     #ffffff;
+  --ink-2:     #c3c2b7;
+  --ink-3:     #898781;
+  --grid:      #2c2c2a;
+  --rule:      #383835;
+  --border:    rgba(255,255,255,0.10);
+  --wash:      rgba(255,255,255,0.045);
+  --accent:    #3987e5;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--plane);
+  color: var(--ink-1);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+.wrap { max-width: 1500px; margin: 0 auto; padding: 20px 20px 64px; }
+
+/* ---------- header ---------- */
+header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 4px; }
+h1 { font-size: 19px; margin: 0; letter-spacing: -0.01em; }
+.rootpath {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px; color: var(--ink-3);
+}
+.spacer { flex: 1 1 auto; }
+.meta { font-size: 12px; color: var(--ink-2); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+.mode-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 600;
+  border: 1px solid var(--border); background: var(--surface-1); color: var(--ink-2);
+}
+.mode-badge .pip { width: 7px; height: 7px; border-radius: 50%; background: var(--good); }
+.mode-badge.snapshot .pip { background: var(--ink-3); }
+.mode-badge.live.busy .pip { animation: pulse 1s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.25 } }
+
+button, select, input[type="search"] {
+  font: inherit; font-size: 13px; color: var(--ink-1);
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 5px 10px;
+}
+button { cursor: pointer; }
+button:hover, select:hover { background: var(--wash); }
+button:focus-visible, select:focus-visible, input:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 1px;
+}
+
+/* ---------- stat tiles ---------- */
+.tiles {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 10px; margin: 18px 0;
+}
+.tile {
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 11px 13px;
+  cursor: pointer; text-align: left; display: block; width: 100%;
+}
+.tile:hover { background: var(--wash); }
+.tile[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.tile .v { font-size: 25px; font-weight: 600; line-height: 1.1; letter-spacing: -0.02em; }
+.tile .k { font-size: 11px; color: var(--ink-2); margin-top: 3px; display: flex; align-items: center; gap: 5px; }
+.tile .k .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+
+/* ---------- controls ---------- */
+.controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+input[type="search"] { min-width: 210px; flex: 0 1 280px; }
+.chip {
+  padding: 4px 10px; border-radius: 999px; font-size: 12px;
+  border: 1px solid var(--border); background: var(--surface-1);
+  color: var(--ink-2); cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+}
+.chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+.chip .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+
+/* ---------- table ---------- */
+.card {
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: var(--radius); overflow: hidden;
+}
+table { width: 100%; border-collapse: collapse; }
+thead th {
+  text-align: left; font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--ink-3);
+  padding: 9px 10px; border-bottom: 1px solid var(--rule); white-space: nowrap;
+  background: var(--surface-1); position: sticky; top: 0; z-index: 2;
+}
+thead th.sortable { cursor: pointer; user-select: none; }
+thead th.sortable:hover { color: var(--ink-1); }
+tbody td { padding: 8px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+tbody tr.repo { cursor: pointer; }
+tbody tr.repo:hover td { background: var(--wash); }
+tbody tr.repo.open td { background: var(--wash); }
+.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+.status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.status .ico { width: 14px; text-align: center; font-size: 12px; line-height: 1; }
+.s-good     { color: var(--good); }
+.s-warning  { color: #8a6100; }
+.s-serious  { color: #a2461f; }
+.s-critical { color: var(--critical); }
+.s-info     { color: var(--ink-2); }
+:root[data-theme="dark"] .s-warning, :root:not([data-theme="light"]) .s-warning { color: var(--warning); }
+:root[data-theme="dark"] .s-serious, :root:not([data-theme="light"]) .s-serious { color: var(--serious); }
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .s-warning { color: #8a6100; }
+  :root:not([data-theme="dark"]) .s-serious { color: #a2461f; }
+}
+
+.name { font-weight: 600; }
+.name a { color: inherit; text-decoration: none; border-bottom: 1px solid var(--border); }
+.name a:hover { border-bottom-color: var(--accent); color: var(--accent); }
+.headline { color: var(--ink-2); font-size: 12px; margin-top: 2px; }
+
+.branch { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.branch .warnmark { color: var(--serious); font-weight: 700; }
+
+.counts { display: inline-flex; gap: 8px; font-variant-numeric: tabular-nums; font-size: 12px; }
+.counts span { color: var(--ink-3); }
+.counts b { font-weight: 600; color: var(--ink-1); }
+
+.badges { display: flex; gap: 3px; flex-wrap: wrap; }
+tbody td:last-child { width: 168px; }
+.badge {
+  font-size: 9.5px; font-weight: 600; letter-spacing: 0.01em;
+  padding: 1px 4px; border-radius: 4px;
+  border: 1px solid var(--border); color: var(--ink-2); background: var(--plane);
+  white-space: nowrap;
+}
+.badge.on { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+
+.age { color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.subject { color: var(--ink-3); font-size: 12px; margin-top: 2px; max-width: 34ch;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- detail ---------- */
+tr.detail td { background: var(--plane); padding: 0; }
+.detailbox { padding: 12px 14px 14px 40px; display: grid; gap: 12px 18px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+/* grid children default to min-width:auto, which lets long paths and commit
+   subjects push a column wider than its track. */
+.detailbox > div { min-width: 0; }
+.detailbox li, .detailbox .mono { overflow-wrap: anywhere; }
+.detailbox h4 { margin: 0 0 5px; font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--ink-3); font-weight: 600; }
+.detailbox ul { margin: 0; padding-left: 16px; max-height: 300px; overflow-y: auto; }
+.detailbox li { font-size: 12px; color: var(--ink-2); margin-bottom: 2px; }
+.detailbox code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+.cmd { background: var(--surface-1); border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 8px; margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere;
+  color: var(--ink-1); max-width: 100%; }
+
+/* ---------- misc ---------- */
+.empty { padding: 34px; text-align: center; color: var(--ink-3); }
+.section-title { font-size: 13px; font-weight: 600; margin: 26px 0 8px; display: flex; align-items: center; gap: 8px; }
+.notice { border: 1px solid var(--border); border-left: 3px solid var(--ink-3);
+  background: var(--surface-1); border-radius: var(--radius);
+  padding: 9px 12px; font-size: 12.5px; color: var(--ink-2); margin: 12px 0; }
+.notice.warn { border-left-color: var(--warning); }
+.nongit { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+.nongit div { border: 1px solid var(--border); background: var(--surface-1);
+  border-radius: var(--radius); padding: 8px 10px; font-size: 12px; }
+.nongit .n { font-weight: 600; font-size: 13px; }
+.nongit .s { color: var(--ink-3); margin-top: 2px; }
+footer { margin-top: 26px; font-size: 11.5px; color: var(--ink-3); display: flex;
+  gap: 12px; flex-wrap: wrap; align-items: center; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+@media (max-width: 900px) {
+  .col-opt { display: none; }
+  .detailbox { padding-left: 14px; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Repo Dashboard</h1>
+    <span class="rootpath" id="rootpath"></span>
+    <span class="spacer"></span>
+    <div class="meta">
+      <span class="mode-badge" id="modeBadge"><span class="pip"></span><span id="modeText">…</span></span>
+      <span id="scanTime"></span>
+      <label class="visually-hidden" for="interval">Auto-refresh interval</label>
+      <select id="interval" title="Auto-refresh interval">
+        <option value="0">manual</option>
+        <option value="10">10s</option>
+        <option value="30" selected>30s</option>
+        <option value="60">60s</option>
+        <option value="300">5m</option>
+      </select>
+      <button id="refresh" title="Refresh now (r)">Refresh</button>
+      <button id="theme" title="Toggle light/dark">◐</button>
+    </div>
+  </header>
+
+  <div class="tiles" id="tiles"></div>
+  <div id="ghNotice"></div>
+
+  <div class="controls">
+    <input type="search" id="q" placeholder="Filter repos, branches, commits…  (/)" aria-label="Filter repos">
+    <button class="chip" id="onlyAction" aria-pressed="false">Needs action only</button>
+    <button class="chip" id="onlyAgent" aria-pressed="false"><span class="dot" style="background:var(--serious)"></span>Agent branches</button>
+    <span class="spacer"></span>
+    <label class="visually-hidden" for="sort">Sort</label>
+    <select id="sort">
+      <option value="attention">Sort: attention</option>
+      <option value="name">Sort: name</option>
+      <option value="recent">Sort: last commit</option>
+      <option value="stalest">Sort: stalest</option>
+      <option value="branch">Sort: branch</option>
+    </select>
+    <button id="expandAll">Expand all</button>
+  </div>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:1%"></th>
+          <th>Status</th>
+          <th>Repo</th>
+          <th>Branch</th>
+          <th class="num">Push</th>
+          <th class="num col-opt">Working tree</th>
+          <th class="col-opt">Last commit</th>
+          <th class="col-opt">PR / CI</th>
+          <th class="col-opt">Agent</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="emptyMsg" hidden>No repos match this filter.</div>
+  </div>
+
+  <div class="section-title">Directories not under version control (<span id="ngCount">0</span>)</div>
+  <div class="nongit" id="nongit"></div>
+
+  <footer>
+    <span id="footScan"></span>
+    <span id="footHint">Click a row for detail · <b>/</b> filter · <b>r</b> refresh · <b>e</b> expand</span>
+  </footer>
+</div>
+<script>
+/* Static export inlines the payload here; the live server leaves it null and
+   the page fetches /api/repos instead. */
+const BOOTSTRAP = /*__DATA__*/null/*__ENDDATA__*/;
+</script>
+<script src="app.js"></script>
+</body>
+</html>

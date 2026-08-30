@@ -1,0 +1,22 @@
+# Live repo dashboard as a user service.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp ~/repos/repo-dashboard/repodash.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now repodash
+#   systemctl --user status repodash
+#
+# Then http://127.0.0.1:8787/ is always up. Loopback only.
+[Unit]
+Description=repodash - live git status dashboard for ~/repos
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/repos/repo-dashboard/repodash.py --root %h/repos serve --host 127.0.0.1 --port 8787 --interval 20
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=%h/repos/repo-dashboard
+
+[Install]
+WantedBy=default.target
