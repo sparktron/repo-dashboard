@@ -31,6 +31,25 @@ DEFAULT_PORT = int(os.environ.get("REPODASH_PORT", "8787"))
 ALLOWED_HOSTNAMES = {"localhost", "127.0.0.1", "[::1]", "::1"}
 
 
+def merge_extra(cli_also):
+    """extra-repos.txt, then REPODASH_ALSO, then --also. Unique, order kept."""
+    extras = scanmod.load_extra_repos()
+    env = os.environ.get("REPODASH_ALSO") or ""
+    for part in env.replace(",", ":").split(":"):
+        part = part.strip()
+        if part:
+            extras.append(part)
+    extras.extend(cli_also or [])
+    seen, out = set(), []
+    for path in extras:
+        key = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
 # --------------------------------------------------------------------------
 # page assembly -- one code path for both server and export
 # --------------------------------------------------------------------------
@@ -58,15 +77,16 @@ def render_page(data=None):
 # --------------------------------------------------------------------------
 
 class Store:
-    def __init__(self, root, use_gh=True, gh_ttl=ghinfo.DEFAULT_TTL):
+    def __init__(self, root, extra=None, use_gh=True, gh_ttl=ghinfo.DEFAULT_TTL):
         self.root = root
+        self.extra = list(extra or [])
         self.use_gh = use_gh
         self.gh_ttl = gh_ttl
         self.lock = threading.Lock()
         self.data = None
 
     def refresh(self, force_gh=False):
-        d = scanmod.scan_all(self.root)
+        d = scanmod.scan_all(self.root, extra=self.extra)
         if self.use_gh:
             try:
                 d["gh_status"] = ghinfo.enrich(d["repos"], ttl=self.gh_ttl,
@@ -148,7 +168,8 @@ def make_handler(store):
 
 
 def cmd_serve(args):
-    store = Store(args.root, use_gh=not args.no_gh, gh_ttl=args.gh_ttl)
+    extra = merge_extra(args.also)
+    store = Store(args.root, extra=extra, use_gh=not args.no_gh, gh_ttl=args.gh_ttl)
     print("[repodash] scanning %s …" % args.root, flush=True)
     d = store.refresh()
     print("[repodash] %d repos in %.2fs (%d need action)"
@@ -182,7 +203,8 @@ def cmd_serve(args):
 
 
 def cmd_export(args):
-    store = Store(args.root, use_gh=not args.no_gh, gh_ttl=args.gh_ttl)
+    extra = merge_extra(args.also)
+    store = Store(args.root, extra=extra, use_gh=not args.no_gh, gh_ttl=args.gh_ttl)
     d = store.refresh(force_gh=args.refresh_gh)
     html = render_page(d)
     out = os.path.abspath(args.out)
@@ -207,7 +229,8 @@ ANSI = {"critical": "\033[31;1m", "serious": "\033[33;1m", "warning": "\033[33m"
 
 
 def cmd_scan(args):
-    store = Store(args.root, use_gh=not args.no_gh, gh_ttl=args.gh_ttl)
+    extra = merge_extra(args.also)
+    store = Store(args.root, extra=extra, use_gh=not args.no_gh, gh_ttl=args.gh_ttl)
     d = store.refresh()
     if args.json:
         json.dump(d, sys.stdout, indent=1)
@@ -246,6 +269,8 @@ def main(argv=None):
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--root", default=DEFAULT_ROOT,
                    help="folder containing the repos (default: %(default)s)")
+    p.add_argument("--also", action="append", default=[], metavar="PATH",
+                   help="extra git repo, or folder of repos (repeatable)")
     p.add_argument("--no-gh", action="store_true",
                    help="skip the gh CLI entirely (no PR/CI columns)")
     p.add_argument("--gh-ttl", type=int, default=ghinfo.DEFAULT_TTL,

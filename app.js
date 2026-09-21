@@ -98,7 +98,7 @@
       { k: "Clean & synced", v: s.counts.good, status: "good", filter: "good",
         title: "Nothing outstanding" },
       { k: "Repos tracked", v: s.repo_count, status: null, filter: null,
-        title: "Git repos found directly under the root" }
+        title: "Git repos scanned (--root children plus extra-repos.txt)" }
     ];
     $("tiles").innerHTML = tiles.map(function (t) {
       var pressed = (t.filter === "action" && state.onlyAction) ||
@@ -378,7 +378,12 @@
   function render() {
     if (!state.data) return;
     var d = state.data;
-    $("rootpath").textContent = d.root;
+    $("rootpath").textContent = (d.extra && d.extra.length)
+      ? d.root + " +" + d.extra.length + " extra"
+      : d.root;
+    $("rootpath").title = d.extra && d.extra.length
+      ? [d.root].concat(d.extra).join("\n")
+      : (d.root || "");
     $("scanTime").textContent = "scanned " + clock(d.generated_at) +
       " (" + d.scan_seconds + "s)";
     $("footScan").textContent = d.summary.repo_count + " git repos, " +

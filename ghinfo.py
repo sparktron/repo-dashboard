@@ -25,6 +25,10 @@ DEFAULT_TTL = 300          # seconds a cached result stays fresh
 GH_TIMEOUT = 20            # per gh invocation
 MAX_WORKERS = 6            # keep well under secondary rate limits
 
+# gh on this machine is a personal-account login. Do not call it against
+# Mythos org remotes (ai-hub AGENTS.md rule 13).
+MYTHOS_GH_ORGS = {"mythos-ai", "mythosDylan"}
+
 
 def gh_status():
     """What we can actually do right now, with a human-readable reason."""
@@ -55,6 +59,17 @@ def _gh_json(args, timeout=GH_TIMEOUT):
         return json.loads(out), None
     except json.JSONDecodeError as e:
         return None, "unparseable gh output: %s" % e
+
+
+def gh_eligible(repo):
+    """Whether this repo may be queried with the personal `gh` login."""
+    if repo.get("remote_host") != "github.com":
+        return False
+    slug = repo.get("remote_slug") or ""
+    if not slug or "/" not in slug:
+        return False
+    owner = slug.split("/", 1)[0]
+    return owner not in MYTHOS_GH_ORGS
 
 
 def fetch_repo(slug, branch):
@@ -148,11 +163,19 @@ def enrich(repos, ttl=DEFAULT_TTL, force=False):
     status = gh_status()
     cache = load_cache()
 
-    targets = [
-        r for r in repos
-        if r.get("remote_host") == "github.com" and r.get("remote_slug")
-    ]
+    skipped = 0
+    targets = []
+    for r in repos:
+        if gh_eligible(r):
+            targets.append(r)
+        elif r.get("remote_host") == "github.com" and r.get("remote_slug"):
+            r["gh"] = {
+                "skipped": True,
+                "reason": "Mythos org remote; personal gh login is not used here",
+            }
+            skipped += 1
     status["candidate_repos"] = len(targets)
+    status["skipped_mythos"] = skipped
 
     if not status["available"]:
         # Serve stale cache if we have one -- better than an empty column.
