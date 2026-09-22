@@ -94,6 +94,12 @@ class GhSkip(unittest.TestCase):
             "remote_slug": "mythosDylan/Experimental",
         }))
 
+    def test_mythos_org_check_ignores_case(self):
+        for slug in ("MYTHOS-AI/repo", "mythosdylan/repo", "MythosDylan/repo"):
+            self.assertFalse(ghinfo.gh_eligible({
+                "remote_host": "github.com", "remote_slug": slug,
+            }), slug)
+
     def test_non_github_is_not_eligible(self):
         self.assertFalse(ghinfo.gh_eligible({
             "remote_host": "gitlab.com",

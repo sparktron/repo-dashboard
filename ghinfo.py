@@ -26,8 +26,9 @@ GH_TIMEOUT = 20            # per gh invocation
 MAX_WORKERS = 6            # keep well under secondary rate limits
 
 # gh on this machine is a personal-account login. Do not call it against
-# Mythos org remotes (ai-hub AGENTS.md rule 13).
-MYTHOS_GH_ORGS = {"mythos-ai", "mythosDylan"}
+# Mythos org remotes (ai-hub AGENTS.md rule 13). GitHub owner names are
+# case-insensitive, so compare casefolded.
+MYTHOS_GH_ORGS = {o.casefold() for o in ("mythos-ai", "mythosDylan")}
 
 
 def gh_status():
@@ -69,7 +70,7 @@ def gh_eligible(repo):
     if not slug or "/" not in slug:
         return False
     owner = slug.split("/", 1)[0]
-    return owner not in MYTHOS_GH_ORGS
+    return owner.casefold() not in MYTHOS_GH_ORGS
 
 
 def fetch_repo(slug, branch):
