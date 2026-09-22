@@ -1,7 +1,9 @@
 # repodash
 
-A live status dashboard for every git repo under `~/repos`, built to answer one
-question quickly: **where did an agent leave something unfinished?**
+A live status dashboard for every git repo under `~/repos`, plus extra trees
+listed in `extra-repos.txt` (home-directory clones such as `~/mythos` and
+`~/mythos-docs`). Built to answer one question quickly: **where did an agent
+leave something unfinished?**
 
 Stdlib Python only — no pip install, no dependencies. It reads git state and
 never writes to a repo.
@@ -18,7 +20,13 @@ cd ~/repos/repo-dashboard
 ```
 
 Root defaults to this directory's parent (`~/repos`). Override with `--root` or
-`REPODASH_ROOT`.
+`REPODASH_ROOT`. Extra git repos (or folders of repos) come from
+`extra-repos.txt`, then `REPODASH_ALSO` (colon- or comma-separated), then
+repeatable `--also PATH`. Missing extra paths are skipped.
+
+`gh` enrichment is skipped for `mythos-ai` and `mythosDylan` remotes: the CLI
+on this machine is a personal-account login and must not be used against those
+orgs.
 
 To keep it always-on, see `repodash.service` (systemd user unit, loopback only).
 
@@ -65,9 +73,11 @@ Read them before pasting — some are destructive in the wrong repo.
 | File | Role |
 |---|---|
 | `scan.py` | Git data collection and the classification rules. Start here to add a signal. |
+| `extra-repos.txt` | Home-directory clones scanned in addition to `--root`. |
 | `ghinfo.py` | Optional `gh` enrichment, cached and fully degradable. |
 | `repodash.py` | CLI, HTTP server, static export. |
 | `ui.html` / `app.js` | The dashboard. Inlined into one file on export. |
+| `test_scan.py` | Extra-root discovery and Mythos `gh` skip. |
 
 ## Automation
 

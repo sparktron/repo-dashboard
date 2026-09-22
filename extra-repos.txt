@@ -1,0 +1,5 @@
+# Git repos (or directories of sibling git repos) scanned in addition to --root.
+# Missing paths are skipped so a machine without the clone stays quiet.
+# Override/extend with --also PATH or REPODASH_ALSO=path:path
+~/mythos
+~/mythos-docs

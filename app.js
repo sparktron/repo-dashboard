@@ -98,7 +98,7 @@
       { k: "Clean & synced", v: s.counts.good, status: "good", filter: "good",
         title: "Nothing outstanding" },
       { k: "Repos tracked", v: s.repo_count, status: null, filter: null,
-        title: "Git repos found directly under the root" }
+        title: "Git repos scanned (--root children plus extra-repos.txt)" }
     ];
     $("tiles").innerHTML = tiles.map(function (t) {
       var pressed = (t.filter === "action" && state.onlyAction) ||
@@ -305,7 +305,7 @@
     $("emptyMsg").hidden = true;
 
     tb.innerHTML = repos.map(function (r) {
-      var open = state.expanded.has(r.name);
+      var open = state.expanded.has(r.path);
       var lc = r.last_commit;
       var nameCell = r.remote_slug
         ? '<a href="https://' + esc(r.remote_host) + '/' + esc(r.remote_slug) +
@@ -323,7 +323,7 @@
       }
 
       var row =
-        '<tr class="repo' + (open ? " open" : "") + '" data-name="' + esc(r.name) +
+        '<tr class="repo' + (open ? " open" : "") + '" data-path="' + esc(r.path) +
           '" tabindex="0" aria-expanded="' + open + '">' +
           '<td style="color:var(--ink-3)">' + (open ? "▾" : "▸") + '</td>' +
           '<td>' + statusCell(r) + '</td>' +
@@ -378,7 +378,12 @@
   function render() {
     if (!state.data) return;
     var d = state.data;
-    $("rootpath").textContent = d.root;
+    $("rootpath").textContent = (d.extra && d.extra.length)
+      ? d.root + " +" + d.extra.length + " extra"
+      : d.root;
+    $("rootpath").title = d.extra && d.extra.length
+      ? [d.root].concat(d.extra).join("\n")
+      : (d.root || "");
     $("scanTime").textContent = "scanned " + clock(d.generated_at) +
       " (" + d.scan_seconds + "s)";
     $("footScan").textContent = d.summary.repo_count + " git repos, " +
@@ -442,7 +447,7 @@
     }
     var row = e.target.closest("tr.repo");
     if (row) {
-      var n = row.getAttribute("data-name");
+      var n = row.getAttribute("data-path");
       if (state.expanded.has(n)) state.expanded.delete(n); else state.expanded.add(n);
       renderRows();
     }
@@ -478,8 +483,9 @@
   $("interval").addEventListener("change", scheduleRefresh);
   $("expandAll").addEventListener("click", function () {
     var vis = visibleRepos();
-    if (state.expanded.size >= vis.length && vis.length) state.expanded.clear();
-    else vis.forEach(function (r) { state.expanded.add(r.name); });
+    var allOpen = vis.length && vis.every(function (r) { return state.expanded.has(r.path); });
+    if (allOpen) state.expanded.clear();
+    else vis.forEach(function (r) { state.expanded.add(r.path); });
     renderRows();
   });
   $("theme").addEventListener("click", function () {

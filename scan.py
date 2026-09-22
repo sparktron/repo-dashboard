@@ -416,6 +416,30 @@ def classify(r):
 # root walk
 # --------------------------------------------------------------------------
 
+EXTRA_REPOS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "extra-repos.txt")
+
+
+def is_git_dir(path):
+    return os.path.exists(os.path.join(path, ".git"))
+
+
+def load_extra_repos(path=None):
+    """Read extra scan targets from extra-repos.txt. Missing file → []."""
+    path = path or EXTRA_REPOS_FILE
+    extras = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                extras.append(os.path.expanduser(line))
+    except OSError:
+        pass
+    return extras
+
+
 def discover(root):
     """Return (git_repo_paths, non_git_dirs) for direct children of root."""
     repos, plain = [], []
@@ -429,12 +453,34 @@ def discover(root):
             continue
         if e.name in SKIP_DIRS:
             continue
-        gitpath = os.path.join(e.path, ".git")
-        if os.path.exists(gitpath):
+        if is_git_dir(e.path):
             repos.append(e.path)
         else:
             plain.append(e.path)
     return repos, plain
+
+
+def add_scan_target(path, repos, seen):
+    """Include a git repo, or the git-repo children of a directory.
+
+    Missing paths are skipped. Duplicates (by realpath) are skipped so an
+    extra that already sits under --root is not scanned twice.
+    """
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isdir(path):
+        return
+    if is_git_dir(path):
+        real = os.path.realpath(path)
+        if real not in seen:
+            seen.add(real)
+            repos.append(path)
+        return
+    child_repos, _plain = discover(path)
+    for child in child_repos:
+        real = os.path.realpath(child)
+        if real not in seen:
+            seen.add(real)
+            repos.append(child)
 
 
 def describe_plain(path):
@@ -464,9 +510,13 @@ def describe_plain(path):
     return d
 
 
-def scan_all(root, workers=16):
+def scan_all(root, extra=None, workers=16):
     started = time.time()
+    extra = list(extra or [])
     repo_paths, plain_paths = discover(root)
+    seen = {os.path.realpath(p) for p in repo_paths}
+    for path in extra:
+        add_scan_target(path, repo_paths, seen)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         repos = list(pool.map(scan_repo, repo_paths))
@@ -481,6 +531,7 @@ def scan_all(root, workers=16):
     return {
         "generated_at": int(time.time()),
         "root": root,
+        "extra": extra,
         "scan_seconds": round(time.time() - started, 2),
         "repos": sorted(repos, key=lambda r: (SEVERITY_ORDER[r["status"]],
                                               r["name"].lower())),
