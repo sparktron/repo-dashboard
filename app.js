@@ -508,8 +508,13 @@
     btn.setAttribute("aria-label", "Theme: " + mode);
   }
 
+  // Three-state cycle so "follow the OS" stays reachable. The order is seeded
+  // from the OS preference: leaving system goes to the opposite of what is on
+  // screen, so the first click always visibly changes something.
   function nextTheme(cur) {
-    return cur === "system" ? "light" : cur === "light" ? "dark" : "system";
+    var osDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+    var cycle = osDark ? ["system", "light", "dark"] : ["system", "dark", "light"];
+    return cycle[(cycle.indexOf(cur) + 1) % cycle.length];
   }
 
   $("theme").addEventListener("click", function () {
