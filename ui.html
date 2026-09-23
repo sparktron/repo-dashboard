@@ -4,53 +4,40 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Repo Dashboard</title>
+<script>
+/* Runs before first paint so a stored theme never flashes the wrong palette.
+   No stored value means "follow the OS", which the CSS handles on its own. */
+(function () {
+  try {
+    var t = localStorage.getItem("repodash-theme");
+    if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
+  } catch (e) { /* storage blocked (private window, file://) — fall back to OS */ }
+})();
+</script>
 <style>
 :root {
-  color-scheme: light;
-  --surface-1:  #fcfcfb;
-  --plane:      #f9f9f7;
-  --ink-1:      #0b0b0b;
-  --ink-2:      #52514e;
-  --ink-3:      #898781;
-  --grid:       #e1e0d9;
-  --rule:       #c3c2b7;
-  --border:     rgba(11,11,11,0.10);
-  --wash:       rgba(11,11,11,0.035);
-  --good:       #0ca30c;
-  --warning:    #fab219;
-  --serious:    #ec835a;
-  --critical:   #d03b3b;
-  --accent:     #2a78d6;
+  /* `light-dark()` resolves against the used color-scheme, so each token is
+     declared once instead of once per theme block. */
+  color-scheme: light dark;
+  --surface-1:  light-dark(#fcfcfb, #1a1a19);
+  --plane:      light-dark(#f9f9f7, #0d0d0d);
+  --ink-1:      light-dark(#0b0b0b, #ffffff);
+  --ink-2:      light-dark(#52514e, #c3c2b7);
+  --ink-3:      light-dark(#898781, #898781);
+  --grid:       light-dark(#e1e0d9, #2c2c2a);
+  --rule:       light-dark(#c3c2b7, #383835);
+  --border:     light-dark(rgba(11,11,11,0.10), rgba(255,255,255,0.10));
+  --wash:       light-dark(rgba(11,11,11,0.035), rgba(255,255,255,0.045));
+  --good:       light-dark(#0ca30c, #35c246);
+  --warning:    light-dark(#8a6100, #fab219);
+  --serious:    light-dark(#a2461f, #ec835a);
+  --critical:   light-dark(#d03b3b, #ef6a6a);
+  --accent:     light-dark(#2a78d6, #3987e5);
   --radius: 8px;
 }
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    color-scheme: dark;
-    --surface-1: #1a1a19;
-    --plane:     #0d0d0d;
-    --ink-1:     #ffffff;
-    --ink-2:     #c3c2b7;
-    --ink-3:     #898781;
-    --grid:      #2c2c2a;
-    --rule:      #383835;
-    --border:    rgba(255,255,255,0.10);
-    --wash:      rgba(255,255,255,0.045);
-    --accent:    #3987e5;
-  }
-}
-:root[data-theme="dark"] {
-  color-scheme: dark;
-  --surface-1: #1a1a19;
-  --plane:     #0d0d0d;
-  --ink-1:     #ffffff;
-  --ink-2:     #c3c2b7;
-  --ink-3:     #898781;
-  --grid:      #2c2c2a;
-  --rule:      #383835;
-  --border:    rgba(255,255,255,0.10);
-  --wash:      rgba(255,255,255,0.045);
-  --accent:    #3987e5;
-}
+/* An explicit choice pins color-scheme; every token follows from it. */
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"]  { color-scheme: dark; }
 
 * { box-sizing: border-box; }
 body {
@@ -142,16 +129,10 @@ tbody tr.repo.open td { background: var(--wash); }
 .status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; white-space: nowrap; }
 .status .ico { width: 14px; text-align: center; font-size: 12px; line-height: 1; }
 .s-good     { color: var(--good); }
-.s-warning  { color: #8a6100; }
-.s-serious  { color: #a2461f; }
+.s-warning  { color: var(--warning); }
+.s-serious  { color: var(--serious); }
 .s-critical { color: var(--critical); }
 .s-info     { color: var(--ink-2); }
-:root[data-theme="dark"] .s-warning, :root:not([data-theme="light"]) .s-warning { color: var(--warning); }
-:root[data-theme="dark"] .s-serious, :root:not([data-theme="light"]) .s-serious { color: var(--serious); }
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) .s-warning { color: #8a6100; }
-  :root:not([data-theme="dark"]) .s-serious { color: #a2461f; }
-}
 
 .name { font-weight: 600; }
 .name a { color: inherit; text-decoration: none; border-bottom: 1px solid var(--border); }
@@ -235,7 +216,7 @@ footer { margin-top: 26px; font-size: 11.5px; color: var(--ink-3); display: flex
         <option value="300">5m</option>
       </select>
       <button id="refresh" title="Refresh now (r)">Refresh</button>
-      <button id="theme" title="Toggle light/dark">◐</button>
+      <button id="theme" title="Theme: follow system" aria-label="Theme: follow system">◐</button>
     </div>
   </header>
 

@@ -488,12 +488,35 @@
     else vis.forEach(function (r) { state.expanded.add(r.path); });
     renderRows();
   });
+  // ---------- theme ----------
+  // The inline script in ui.html already applied any stored choice before
+  // paint; this only handles changes made from the button.
+  var THEME_KEY = "repodash-theme";
+  var THEME_ICON = { light: "☀", dark: "☾", system: "◐" };
+
+  function applyTheme(mode) {
+    var root = document.documentElement;
+    if (mode === "system") root.removeAttribute("data-theme");
+    else root.setAttribute("data-theme", mode);
+    try {
+      if (mode === "system") localStorage.removeItem(THEME_KEY);
+      else localStorage.setItem(THEME_KEY, mode);
+    } catch (e) { /* storage blocked — theme still applies for this page load */ }
+    var btn = $("theme");
+    btn.textContent = THEME_ICON[mode];
+    btn.title = "Theme: " + mode + " (click to change)";
+    btn.setAttribute("aria-label", "Theme: " + mode);
+  }
+
+  function nextTheme(cur) {
+    return cur === "system" ? "light" : cur === "light" ? "dark" : "system";
+  }
+
   $("theme").addEventListener("click", function () {
-    var cur = document.documentElement.getAttribute("data-theme");
-    var next = cur === "dark" ? "light" : cur === "light" ? "dark"
-      : (window.matchMedia("(prefers-color-scheme: dark)").matches ? "light" : "dark");
-    document.documentElement.setAttribute("data-theme", next);
+    var cur = document.documentElement.getAttribute("data-theme") || "system";
+    applyTheme(nextTheme(cur));
   });
+  applyTheme(document.documentElement.getAttribute("data-theme") || "system");
 
   // ---------- boot ----------
   if (LIVE) {
