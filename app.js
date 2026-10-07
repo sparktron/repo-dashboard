@@ -11,7 +11,9 @@
     sort: "attention",
     expanded: new Set(),
     busy: false,
-    lastError: null
+    lastError: null,
+    gitBusy: {},     // path -> "pull" | "push" while a click is in flight
+    gitResult: {}    // path -> { action, ok, output, ts } from the last click
   };
 
   var SEV = { critical: 0, serious: 1, warning: 2, info: 3, good: 4 };
@@ -130,6 +132,44 @@
     if (a) parts.push('<b style="color:var(--warning)">↑' + a + '</b>');
     if (b) parts.push('<b style="color:var(--ink-2)">↓' + b + '</b>');
     return '<span class="counts">' + parts.join(" ") + '</span>';
+  }
+
+  // Mirrors git_action_args() in repodash.py; the server re-checks anyway.
+  function gitBlock(r, action) {
+    if (r.operation) return r.operation + " in progress";
+    if (r.detached || !r.branch) return "detached HEAD";
+    if (action === "pull") {
+      if (!r.upstream) return "no upstream to pull from";
+      return null;
+    }
+    if (!r.has_remote) return "no origin remote";
+    if (r.upstream && !r.ahead) return "nothing to push";
+    return null;
+  }
+
+  function syncButtons(r) {
+    if (!LIVE || !r.has_remote) return "";
+    var busy = state.gitBusy[r.path];
+    var res = state.gitResult[r.path];
+    function btn(action, label, title) {
+      var why = gitBlock(r, action);
+      var text = busy === action ? (action === "pull" ? "Pulling…" : "Pushing…") : label;
+      return '<button class="gitbtn" data-git="' + action + '" data-path="' + esc(r.path) + '"' +
+        ((why || busy) ? " disabled" : "") +
+        ' title="' + esc(why || title) + '">' + text + '</button>';
+    }
+    var pushTitle = r.upstream ? "git push" : "git push -u origin " + (r.branch || "");
+    var msg = "";
+    if (res && !busy) {
+      msg = res.ok
+        ? '<span class="gitmsg" style="color:var(--good)" title="' + esc(res.output) + '">✓ ' +
+          (res.action === "pull" ? "pulled" : "pushed") + '</span>'
+        : '<span class="gitmsg" style="color:var(--critical)" title="' + esc(res.output) + '">✖ ' +
+          res.action + ' failed</span>';
+    }
+    return '<div class="sync">' + msg +
+      btn("pull", "Pull", "git pull --ff-only") +
+      btn("push", "Push", pushTitle) + '</div>';
   }
 
   function treeCell(r) {
@@ -260,6 +300,13 @@
                 cmds.map(esc).join("\n") + '</div></div>');
     }
 
+    var gr = state.gitResult[r.path];
+    if (gr) {
+      cols.push('<div><h4>Last ' + esc(gr.action) + ' (' + esc(age(gr.ts)) + ' ago)</h4>' +
+                '<div class="cmd" style="' + (gr.ok ? "" : "border-color:var(--critical)") + '">' +
+                esc(gr.output) + '</div></div>');
+    }
+
     if (r.errors && r.errors.length) {
       cols.push('<div><h4>Errors</h4><ul>' + r.errors.map(function (e) {
         return '<li style="color:var(--critical)">' + esc(e) + '</li>';
@@ -330,7 +377,7 @@
           '<td><div class="name">' + nameCell + '</div>' +
               '<div class="headline">' + esc(r.headline) + '</div></td>' +
           '<td><span class="branch">' + esc(r.branch || "—") + branchWarn + '</span></td>' +
-          '<td class="num">' + pushCell(r) + '</td>' +
+          '<td class="num">' + pushCell(r) + syncButtons(r) + '</td>' +
           '<td class="num col-opt">' + treeCell(r) + '</td>' +
           '<td class="col-opt"><div class="age">' + (lc ? esc(age(lc.ts)) + " ago" : "—") + '</div>' +
               (lc ? '<div class="subject" title="' + esc(lc.subject) + '">' + esc(lc.subject) + '</div>' : "") +
@@ -428,8 +475,50 @@
       });
   }
 
+  function gitAction(path, action) {
+    if (!LIVE || state.gitBusy[path]) return;
+    var r = state.data.repos.find(function (x) { return x.path === path; });
+    if (!r) return;
+    if (action === "push" &&
+        !window.confirm("Push " + (r.branch || "HEAD") + " in " + r.name + " to " +
+                        (r.upstream || "origin/" + r.branch) + "?")) return;
+    state.gitBusy[path] = action; renderRows();
+    fetch("/api/git", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json", "X-Repodash": "1" },
+      body: JSON.stringify({ path: path, action: action })
+    })
+      .then(function (res) {
+        return res.text().then(function (t) {
+          var j = null;
+          try { j = JSON.parse(t); } catch (err) { /* plain-text error body */ }
+          if (!j) throw new Error("server returned " + res.status + ": " + t.trim());
+          return j;
+        });
+      })
+      .then(function (j) {
+        if (j.data) state.data = j.data;
+        return { action: action, ok: j.ok, output: j.output };
+      }, function (err) {
+        return { action: action, ok: false, output: err.message };
+      })
+      .then(function (res) {
+        res.ts = Math.floor(Date.now() / 1000);
+        state.gitResult[path] = res;
+        delete state.gitBusy[path];
+        if (!res.ok) state.expanded.add(path);
+        render();
+      });
+  }
+
   // ---------- events ----------
   document.addEventListener("click", function (e) {
+    var gb = e.target.closest(".gitbtn");
+    if (gb) {
+      gitAction(gb.getAttribute("data-path"), gb.getAttribute("data-git"));
+      return;
+    }
     var tile = e.target.closest(".tile");
     if (tile) {
       var f = tile.getAttribute("data-filter");
@@ -454,6 +543,7 @@
   });
 
   document.addEventListener("keydown", function (e) {
+    if (e.target.tagName === "BUTTON" && e.key === "Enter") return;
     if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") {
       if (e.key === "Escape") { e.target.blur(); }
       return;

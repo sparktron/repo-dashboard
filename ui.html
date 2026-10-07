@@ -75,6 +75,8 @@ button, select, input[type="search"] {
 }
 button { cursor: pointer; }
 button:hover, select:hover { background: var(--wash); }
+button:disabled { opacity: 0.45; cursor: default; }
+button:disabled:hover { background: var(--surface-1); }
 button:focus-visible, select:focus-visible, input:focus-visible {
   outline: 2px solid var(--accent); outline-offset: 1px;
 }
@@ -142,6 +144,9 @@ tbody tr.repo.open td { background: var(--wash); }
 .branch { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .branch .warnmark { color: var(--serious); font-weight: 700; }
 
+.sync { display: flex; gap: 4px; justify-content: flex-end; align-items: center; margin-top: 4px; }
+.sync .gitbtn { font-size: 11px; padding: 1px 8px; }
+.sync .gitmsg { font-size: 11px; font-weight: 600; margin-right: 2px; cursor: help; }
 .counts { display: inline-flex; gap: 8px; font-variant-numeric: tabular-nums; font-size: 12px; }
 .counts span { color: var(--ink-3); }
 .counts b { font-weight: 600; color: var(--ink-1); }

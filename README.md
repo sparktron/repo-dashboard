@@ -5,8 +5,13 @@ listed in `extra-repos.txt` (home-directory clones such as `~/mythos` and
 `~/mythos-docs`). Built to answer one question quickly: **where did an agent
 leave something unfinished?**
 
-Stdlib Python only — no pip install, no dependencies. It reads git state and
-never writes to a repo.
+Stdlib Python only — no pip install, no dependencies. Scanning is read-only.
+The only writes are the **Pull** / **Push** buttons on each row of the live
+page (`git pull --ff-only` and a non-force `git push`, or `git push -u origin
+<branch>` for a branch with no upstream), and they run only when you click.
+Push asks for confirmation first. Buttons are disabled when the action can't
+apply (detached HEAD, merge/rebase in progress, no upstream, nothing to push)
+and don't appear in exported snapshots.
 
 ## Run it
 
@@ -101,6 +106,12 @@ Refresh the shareable snapshot on a schedule:
   certainly don't want it.
 - A `Host` header check rejects non-loopback hostnames, which blocks
   DNS-rebinding against the loopback bind.
+- `POST /api/git` (the Pull / Push buttons) also requires an `X-Repodash: 1`
+  header and a loopback `Origin`, so another site open in your browser can't
+  trigger a push: the custom header forces a CORS preflight the server never
+  answers. It acts only on paths from the current scan, one action per repo at
+  a time, with `GIT_TERMINAL_PROMPT=0`, no stdin and a 120s timeout so a
+  credential prompt can't hang the server.
 - All rendered values are HTML-escaped; the export escapes `<` inside the JSON
   payload so repo content can't break out of the `<script>` block.
 - The scanner uses `git --no-optional-locks` and was verified across 7 full
