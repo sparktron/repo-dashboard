@@ -128,26 +128,45 @@ def sh(cwd, *args):
 
 class GitActionArgs(unittest.TestCase):
     BASE = {"branch": "main", "detached": False, "operation": None,
-            "has_remote": True, "upstream": "origin/main"}
+            "has_remote": True, "upstream": "origin/main", "ahead": 1,
+            "branches": [{"name": "main", "gone": False}]}
 
-    def args(self, action, **over):
-        return repodash.git_action_args(dict(self.BASE, **over), action)
+    def args(self, action, remote="origin", merge="refs/heads/main", **over):
+        return repodash.git_action_args(dict(self.BASE, **over), action, remote, merge)
 
-    def test_pull_is_fast_forward_only(self):
-        self.assertEqual(self.args("pull"), (["pull", "--ff-only"], None))
+    def test_pull_is_pinned_and_fast_forward_only(self):
+        self.assertEqual(self.args("pull"), (
+            ["pull", "--ff-only", "--no-rebase", "origin", "refs/heads/main"], None))
 
-    def test_push_never_forces(self):
-        self.assertEqual(self.args("push"), (["push"], None))
+    def test_push_names_remote_and_a_non_forcing_refspec(self):
+        args, _ = self.args("push")
+        self.assertEqual(args, ["push", "--no-follow-tags", "origin",
+                                "refs/heads/main:refs/heads/main"])
+        self.assertFalse(any(a.startswith("+") or a.startswith("--force") for a in args))
+
+    def test_push_targets_the_tracked_branch_name(self):
+        args, _ = self.args("push", merge="refs/heads/trunk", upstream="up/trunk", remote="up")
+        self.assertEqual(args[-2:], ["up", "refs/heads/main:refs/heads/trunk"])
 
     def test_push_without_upstream_publishes_to_origin(self):
-        self.assertEqual(self.args("push", upstream=None),
-                         (["push", "-u", "origin", "main"], None))
+        self.assertEqual(self.args("push", remote=None, merge=None, upstream=None), (
+            ["push", "--no-follow-tags", "-u", "origin",
+             "refs/heads/main:refs/heads/main"], None))
+
+    def test_gone_upstream_blocks_pull_but_allows_push(self):
+        gone = [{"name": "main", "gone": True}]
+        self.assertIsNone(self.args("pull", branches=gone)[0])
+        self.assertIsNotNone(self.args("push", branches=gone, ahead=0)[0])
 
     def test_refusals(self):
         self.assertIsNone(self.args("pull", upstream=None)[0])
         self.assertIsNone(self.args("push", detached=True)[0])
         self.assertIsNone(self.args("pull", operation="rebase")[0])
-        self.assertIsNone(self.args("push", upstream=None, has_remote=False)[0])
+        self.assertIsNone(self.args("push", remote=None, merge=None,
+                                    upstream=None, has_remote=False)[0])
+        self.assertIsNone(self.args("push", ahead=0)[0])
+        # upstream is a local branch (branch.<b>.remote = ".")
+        self.assertIsNone(self.args("push", remote=None, merge=None)[0])
         self.assertIsNone(self.args("fetch")[0])
 
 
@@ -185,6 +204,7 @@ class GitEndpoint(unittest.TestCase):
     def post(self, body, headers=None):
         h = {"Content-Type": "application/json", "X-Repodash": "1"}
         h.update(headers or {})
+        body = dict({"branch": "main"}, **body)
         req = urllib.request.Request(self.url, data=json.dumps(body).encode(),
                                      headers=h, method="POST")
         try:
@@ -213,6 +233,42 @@ class GitEndpoint(unittest.TestCase):
         self.assertTrue(j["ok"], j["output"])
         repo = next(r for r in j["data"]["repos"] if r["path"] == str(self.work))
         self.assertEqual(repo["ahead"], 0)
+
+    def test_push_ignores_push_config_that_would_widen_it(self):
+        # Without an explicit refspec these would push every branch, forced.
+        sh(self.work, "config", "remote.origin.push", "+refs/heads/*:refs/heads/*")
+        sh(self.work, "config", "push.default", "matching")
+        sh(self.work, "branch", "side")
+        sh(self.work, "commit", "-q", "--allow-empty", "-m", "local")
+        self.store.refresh()
+        code, j = self.post({"path": str(self.work), "action": "push"})
+        self.assertTrue(j["ok"], j["output"])
+        heads = subprocess.run(["git", "ls-remote", "--heads", "origin"], cwd=self.work,
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("refs/heads/side", heads)
+
+    def test_branch_switched_since_scan_is_refused(self):
+        sh(self.work, "commit", "-q", "--allow-empty", "-m", "local")
+        self.store.refresh()                      # the page saw main, ahead 1
+        sh(self.work, "checkout", "-q", "-b", "other")
+        before = self.head(self.seed)
+        code, j = self.post({"path": str(self.work), "action": "push"})
+        self.assertFalse(j["ok"])
+        self.assertIn("now on other", j["output"])
+        sh(self.seed, "fetch", "-q")
+        self.assertEqual(self.head(self.seed), before)
+
+    def test_push_recreates_a_deleted_upstream(self):
+        sh(self.seed, "push", "-q", "origin", "HEAD:refs/heads/feat")
+        sh(self.work, "fetch", "-q")
+        sh(self.work, "checkout", "-q", "-b", "feat", "--track", "origin/feat")
+        sh(self.seed, "push", "-q", "origin", ":refs/heads/feat")
+        sh(self.work, "fetch", "-q", "--prune")
+        self.store.refresh()
+        repo = self.store.find(str(self.work))
+        self.assertFalse(repodash.git_action_args(repo, "pull", "origin", "refs/heads/feat")[0])
+        code, j = self.post({"path": str(self.work), "action": "push", "branch": "feat"})
+        self.assertTrue(j["ok"], j["output"])
 
     def test_untracked_path_is_refused(self):
         code, _ = self.post({"path": str(self.seed), "action": "pull"})

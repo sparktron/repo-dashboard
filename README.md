@@ -7,11 +7,14 @@ leave something unfinished?**
 
 Stdlib Python only — no pip install, no dependencies. Scanning is read-only.
 The only writes are the **Pull** / **Push** buttons on each row of the live
-page (`git pull --ff-only` and a non-force `git push`, or `git push -u origin
-<branch>` for a branch with no upstream), and they run only when you click.
-Push asks for confirmation first. Buttons are disabled when the action can't
-apply (detached HEAD, merge/rebase in progress, no upstream, nothing to push)
-and don't appear in exported snapshots.
+page, and they run only when you click. Both name the remote and the exact
+branch, so `remote.<name>.push`, `push.default` and push remotes can't widen
+them: Pull is `git pull --ff-only --no-rebase <remote> <ref>`, Push is
+`git push <remote> refs/heads/<branch>:<upstream ref>` (never forced), or
+`git push -u origin <branch>` for a branch with no upstream. Push asks for
+confirmation first. Buttons are disabled when the action can't apply
+(detached HEAD, merge/rebase in progress, no upstream, upstream deleted on the
+remote, nothing to push) and don't appear in exported snapshots.
 
 ## Run it
 
@@ -110,7 +113,9 @@ Refresh the shareable snapshot on a schedule:
   header and a loopback `Origin`, so another site open in your browser can't
   trigger a push: the custom header forces a CORS preflight the server never
   answers. It acts only on paths from the current scan, one action per repo at
-  a time, with `GIT_TERMINAL_PROMPT=0`, no stdin and a 120s timeout so a
+  a time. It rescans the repo right before running git and refuses if the
+  branch differs from the one shown on the page. Git runs with
+  `GIT_TERMINAL_PROMPT=0`, no stdin and a 120s timeout so a
   credential prompt can't hang the server.
 - All rendered values are HTML-escaped; the export escapes `<` inside the JSON
   payload so repo content can't break out of the `<script>` block.

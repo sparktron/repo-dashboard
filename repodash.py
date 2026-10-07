@@ -57,30 +57,64 @@ def merge_extra(cli_also):
 # pull / push -- the only code path that writes to a repo
 # --------------------------------------------------------------------------
 
-def git_action_args(repo, action):
+def upstream_gone(repo):
+    """The current branch tracks a remote branch that no longer exists."""
+    return any(b["name"] == repo.get("branch") and b.get("gone")
+               for b in repo.get("branches") or [])
+
+
+def tracking_config(path, branch):
+    """(remote, merge ref) for a branch, or (None, None) when it doesn't
+    track a branch on a real remote ("." means a local upstream)."""
+    _, remote, _ = scanmod.git(path, "config", "--get", "branch.%s.remote" % branch)
+    _, merge, _ = scanmod.git(path, "config", "--get", "branch.%s.merge" % branch)
+    if (not remote or remote == "." or remote.startswith("-")
+            or not merge.startswith("refs/heads/")):
+        return None, None
+    return remote, merge
+
+
+def git_action_args(repo, action, remote=None, merge=None):
     """The git argv for a button click, or (None, reason) when it can't run.
-    Pull is fast-forward only and push never forces, so a click can't
-    rewrite history or create a merge commit."""
+
+    Both commands name the remote and the exact ref. Left bare, `git push`
+    defers to remote.<name>.push / push.default / pushRemote and can push
+    other branches or a `+` (forcing) refspec; spelling it out pins the
+    push to the one branch the user confirmed, never forced. Pull is
+    fast-forward only, so a click can't rewrite history or make a merge."""
     if repo.get("operation"):
         return None, "%s in progress -- finish or abort it first" % repo["operation"]
     if repo.get("detached") or not repo.get("branch"):
         return None, "detached HEAD -- check out a branch first"
+    upstream = repo.get("upstream")
+    if upstream and not remote:
+        return None, "upstream %s is not a branch on a remote" % upstream
+    src = "refs/heads/" + repo["branch"]
+    gone = upstream_gone(repo)
     if action == "pull":
-        if not repo.get("upstream"):
+        if not upstream:
             return None, "branch has no upstream to pull from"
-        return ["pull", "--ff-only"], None
+        if gone:
+            return None, "upstream %s was deleted on the remote" % upstream
+        return ["pull", "--ff-only", "--no-rebase", remote, merge], None
     if action == "push":
-        if repo.get("upstream"):
-            return ["push"], None
+        if upstream:
+            if not gone and not repo.get("ahead"):
+                return None, "nothing to push"
+            return ["push", "--no-follow-tags", remote, "%s:%s" % (src, merge)], None
         if repo.get("has_remote"):
-            return ["push", "-u", "origin", repo["branch"]], None
+            return ["push", "--no-follow-tags", "-u", "origin", "%s:%s" % (src, src)], None
         return None, "no origin remote to push to"
     return None, "unknown action: %s" % action
 
 
 def run_git_action(repo, action):
-    """Returns (ok, output). Never prompts: no tty, no stdin, no askpass."""
-    args, reason = git_action_args(repo, action)
+    """Returns (ok, output). Never prompts: no tty, no stdin, no askpass.
+    `repo` must be a fresh scan -- the argv is built from its state."""
+    remote = merge = None
+    if repo.get("upstream") and not repo.get("detached"):
+        remote, merge = tracking_config(repo["path"], repo["branch"])
+    args, reason = git_action_args(repo, action, remote, merge)
     if args is None:
         return False, reason
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
@@ -240,15 +274,14 @@ def make_handler(store):
                 return
             try:
                 req = json.loads(self.rfile.read(length))
-                path, action = req["path"], req["action"]
+                path, action, branch = req["path"], req["action"], req["branch"]
             except (ValueError, KeyError, TypeError):
                 self._send(400, "bad request\n", "text/plain")
                 return
             if action not in ("pull", "push"):
                 self._send(400, "unknown action\n", "text/plain")
                 return
-            repo = store.find(path)
-            if repo is None:
+            if store.find(path) is None:
                 self._send(404, "not a tracked repo\n", "text/plain")
                 return
             if not store.claim(path):
@@ -257,7 +290,17 @@ def make_handler(store):
                            "application/json")
                 return
             try:
-                ok, output = run_git_action(repo, action)
+                # The stored scan can be up to --interval old. Act only on
+                # what the repo looks like now, and only if it is still on
+                # the branch the user saw and confirmed.
+                fresh = scanmod.scan_repo(path)
+                if fresh.get("branch") != branch:
+                    ok, output = False, (
+                        "%s is now on %s, not %s -- nothing was run; check "
+                        "the refreshed row and try again"
+                        % (fresh.get("name"), fresh.get("branch") or "no branch", branch))
+                else:
+                    ok, output = run_git_action(fresh, action)
                 d = store.refresh()
             finally:
                 store.release(path)

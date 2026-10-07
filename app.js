@@ -134,16 +134,23 @@
     return '<span class="counts">' + parts.join(" ") + '</span>';
   }
 
+  // The current branch tracks a remote branch that has since been deleted.
+  function upstreamGone(r) {
+    return (r.branches || []).some(function (b) { return b.name === r.branch && b.gone; });
+  }
+
   // Mirrors git_action_args() in repodash.py; the server re-checks anyway.
   function gitBlock(r, action) {
     if (r.operation) return r.operation + " in progress";
     if (r.detached || !r.branch) return "detached HEAD";
+    var gone = upstreamGone(r);
     if (action === "pull") {
       if (!r.upstream) return "no upstream to pull from";
+      if (gone) return "upstream " + r.upstream + " was deleted on the remote";
       return null;
     }
     if (!r.has_remote) return "no origin remote";
-    if (r.upstream && !r.ahead) return "nothing to push";
+    if (r.upstream && !r.ahead && !gone) return "nothing to push";
     return null;
   }
 
@@ -158,7 +165,9 @@
         ((why || busy) ? " disabled" : "") +
         ' title="' + esc(why || title) + '">' + text + '</button>';
     }
-    var pushTitle = r.upstream ? "git push" : "git push -u origin " + (r.branch || "");
+    var pushTitle = !r.upstream ? "git push -u origin " + (r.branch || "")
+      : upstreamGone(r) ? "recreate " + r.upstream + " on the remote"
+      : "git push to " + r.upstream;
     var msg = "";
     if (res && !busy) {
       msg = res.ok
@@ -168,7 +177,7 @@
           res.action + ' failed</span>';
     }
     return '<div class="sync">' + msg +
-      btn("pull", "Pull", "git pull --ff-only") +
+      btn("pull", "Pull", "git pull --ff-only from " + (r.upstream || "")) +
       btn("push", "Push", pushTitle) + '</div>';
   }
 
@@ -487,7 +496,8 @@
       method: "POST",
       cache: "no-store",
       headers: { "Content-Type": "application/json", "X-Repodash": "1" },
-      body: JSON.stringify({ path: path, action: action })
+      // The server refuses if the repo has left this branch since the scan.
+      body: JSON.stringify({ path: path, action: action, branch: r.branch })
     })
       .then(function (res) {
         return res.text().then(function (t) {
