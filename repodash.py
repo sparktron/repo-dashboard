@@ -5,15 +5,17 @@
     ./repodash.py export           # self-contained HTML snapshot
     ./repodash.py scan             # terminal report (for cron / quick checks)
 
-Stdlib only. Reads git state; never writes to a repo. Binds loopback by
-default -- the page exposes local paths and branch names, so opening it to
-the network takes an explicit --host.
+Stdlib only. Scans are read-only; the only writes are the Pull / Push buttons
+in the live page (fast-forward pull, non-force push), each run on an explicit
+click. Binds loopback by default -- the page exposes local paths and branch
+names, so opening it to the network takes an explicit --host.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -29,6 +31,7 @@ import ghinfo                 # noqa: E402
 DEFAULT_ROOT = os.environ.get("REPODASH_ROOT") or os.path.dirname(HERE)
 DEFAULT_PORT = int(os.environ.get("REPODASH_PORT", "8787"))
 ALLOWED_HOSTNAMES = {"localhost", "127.0.0.1", "[::1]", "::1"}
+GIT_ACTION_TIMEOUT = 120
 
 
 def merge_extra(cli_also):
@@ -48,6 +51,85 @@ def merge_extra(cli_also):
         seen.add(key)
         out.append(path)
     return out
+
+
+# --------------------------------------------------------------------------
+# pull / push -- the only code path that writes to a repo
+# --------------------------------------------------------------------------
+
+def upstream_gone(repo):
+    """The current branch tracks a remote branch that no longer exists."""
+    return any(b["name"] == repo.get("branch") and b.get("gone")
+               for b in repo.get("branches") or [])
+
+
+def tracking_config(path, branch):
+    """(remote, merge ref) for a branch, or (None, None) when it doesn't
+    track a branch on a real remote ("." means a local upstream)."""
+    _, remote, _ = scanmod.git(path, "config", "--get", "branch.%s.remote" % branch)
+    _, merge, _ = scanmod.git(path, "config", "--get", "branch.%s.merge" % branch)
+    if (not remote or remote == "." or remote.startswith("-")
+            or not merge.startswith("refs/heads/")):
+        return None, None
+    return remote, merge
+
+
+def git_action_args(repo, action, remote=None, merge=None):
+    """The git argv for a button click, or (None, reason) when it can't run.
+
+    Both commands name the remote and the exact ref. Left bare, `git push`
+    defers to remote.<name>.push / push.default / pushRemote and can push
+    other branches or a `+` (forcing) refspec; spelling it out pins the
+    push to the one branch the user confirmed, never forced. Pull is
+    fast-forward only, so a click can't rewrite history or make a merge."""
+    if repo.get("operation"):
+        return None, "%s in progress -- finish or abort it first" % repo["operation"]
+    if repo.get("detached") or not repo.get("branch"):
+        return None, "detached HEAD -- check out a branch first"
+    upstream = repo.get("upstream")
+    if upstream and not remote:
+        return None, "upstream %s is not a branch on a remote" % upstream
+    src = "refs/heads/" + repo["branch"]
+    gone = upstream_gone(repo)
+    if action == "pull":
+        if not upstream:
+            return None, "branch has no upstream to pull from"
+        if gone:
+            return None, "upstream %s was deleted on the remote" % upstream
+        return ["pull", "--ff-only", "--no-rebase", remote, merge], None
+    if action == "push":
+        if upstream:
+            if not gone and not repo.get("ahead"):
+                return None, "nothing to push"
+            return ["push", "--no-follow-tags", remote, "%s:%s" % (src, merge)], None
+        if repo.get("has_remote"):
+            return ["push", "--no-follow-tags", "-u", "origin", "%s:%s" % (src, src)], None
+        return None, "no origin remote to push to"
+    return None, "unknown action: %s" % action
+
+
+def run_git_action(repo, action):
+    """Returns (ok, output). Never prompts: no tty, no stdin, no askpass.
+    `repo` must be a fresh scan -- the argv is built from its state."""
+    remote = merge = None
+    if repo.get("upstream") and not repo.get("detached"):
+        remote, merge = tracking_config(repo["path"], repo["branch"])
+    args, reason = git_action_args(repo, action, remote, merge)
+    if args is None:
+        return False, reason
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    try:
+        p = subprocess.run(
+            ["git", *args], cwd=repo["path"], env=env,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            errors="replace", timeout=GIT_ACTION_TIMEOUT, start_new_session=True,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "git %s timed out after %ss" % (" ".join(args), GIT_ACTION_TIMEOUT)
+    except OSError as e:
+        return False, str(e)
+    out = "\n".join(x for x in (p.stdout.strip(), p.stderr.strip()) if x)
+    return p.returncode == 0, "$ git %s\n%s" % (" ".join(args), out or "(no output)")
 
 
 # --------------------------------------------------------------------------
@@ -84,6 +166,7 @@ class Store:
         self.gh_ttl = gh_ttl
         self.lock = threading.Lock()
         self.data = None
+        self.busy_paths = set()   # repos with a pull/push in flight
 
     def refresh(self, force_gh=False):
         d = scanmod.scan_all(self.root, extra=self.extra)
@@ -105,6 +188,25 @@ class Store:
             if self.data is not None:
                 return self.data
         return self.refresh()
+
+    def find(self, path):
+        """A repo from the current scan -- the action endpoint only touches
+        paths the dashboard itself discovered."""
+        for r in self.get()["repos"]:
+            if r["path"] == path:
+                return r
+        return None
+
+    def claim(self, path):
+        with self.lock:
+            if path in self.busy_paths:
+                return False
+            self.busy_paths.add(path)
+            return True
+
+    def release(self, path):
+        with self.lock:
+            self.busy_paths.discard(path)
 
     def run_background(self, interval, stop):
         while not stop.wait(interval):
@@ -143,6 +245,68 @@ def make_handler(store):
             loopback bind, which is the whole security model here."""
             host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
             return host in ALLOWED_HOSTNAMES or host == ""
+
+        def _origin_ok(self):
+            """A cross-site page can still aim a POST at loopback with a
+            loopback Host header, so writes also require a same-origin
+            Origin (when sent) and a custom header. The header forces a
+            CORS preflight, and this server never answers OPTIONS."""
+            if self.headers.get("X-Repodash") != "1":
+                return False
+            origin = self.headers.get("Origin")
+            if origin is None:
+                return True
+            return (urlparse(origin).hostname or "") in ALLOWED_HOSTNAMES
+
+        def do_POST(self):
+            if not self._host_ok() or not self._origin_ok():
+                self._send(403, "forbidden\n", "text/plain")
+                return
+            if urlparse(self.path).path != "/api/git":
+                self._send(404, "not found\n", "text/plain")
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if not 0 < length <= 4096:
+                self._send(400, "bad request\n", "text/plain")
+                return
+            try:
+                req = json.loads(self.rfile.read(length))
+                path, action, branch = req["path"], req["action"], req["branch"]
+            except (ValueError, KeyError, TypeError):
+                self._send(400, "bad request\n", "text/plain")
+                return
+            if action not in ("pull", "push"):
+                self._send(400, "unknown action\n", "text/plain")
+                return
+            if store.find(path) is None:
+                self._send(404, "not a tracked repo\n", "text/plain")
+                return
+            if not store.claim(path):
+                self._send(409, json.dumps({"ok": False, "action": action,
+                                            "output": "another pull/push is running"}),
+                           "application/json")
+                return
+            try:
+                # The stored scan can be up to --interval old. Act only on
+                # what the repo looks like now, and only if it is still on
+                # the branch the user saw and confirmed.
+                fresh = scanmod.scan_repo(path)
+                if fresh.get("branch") != branch:
+                    ok, output = False, (
+                        "%s is now on %s, not %s -- nothing was run; check "
+                        "the refreshed row and try again"
+                        % (fresh.get("name"), fresh.get("branch") or "no branch", branch))
+                else:
+                    ok, output = run_git_action(fresh, action)
+                d = store.refresh()
+            finally:
+                store.release(path)
+            self._send(200, json.dumps({"ok": ok, "action": action,
+                                        "output": output, "data": d}),
+                       "application/json")
 
         def do_GET(self):
             if not self._host_ok():
