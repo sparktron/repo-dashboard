@@ -345,6 +345,7 @@ def make_handler(store, allowed_hosts=None):
             try:
                 req = json.loads(self.rfile.read(length))
                 path, action, branch = req["path"], req["action"], req["branch"]
+                upstream = req["upstream"]      # may be null: "no upstream"
             except (ValueError, KeyError, TypeError):
                 self._send(400, "bad request\n", "text/plain")
                 return
@@ -362,13 +363,21 @@ def make_handler(store, allowed_hosts=None):
             try:
                 # The stored scan can be up to --interval old. Act only on
                 # what the repo looks like now, and only if it is still on
-                # the branch the user saw and confirmed.
+                # the branch the user saw and confirmed, still tracking the
+                # same upstream -- a bulk push can reach a repo minutes after
+                # its one confirmation, and its target must not have moved.
                 fresh = scanmod.scan_repo(path)
                 if fresh.get("branch") != branch:
                     ok, output = False, (
                         "%s is now on %s, not %s -- nothing was run; check "
                         "the refreshed row and try again"
                         % (fresh.get("name"), fresh.get("branch") or "no branch", branch))
+                elif fresh.get("upstream") != upstream:
+                    ok, output = False, (
+                        "%s %s now tracks %s, not %s -- nothing was run; check "
+                        "the refreshed row and try again"
+                        % (fresh.get("name"), branch, fresh.get("upstream") or "no upstream",
+                           upstream or "no upstream"))
                 else:
                     ok, output = run_git_action(fresh, action)
                 d = store.refresh()

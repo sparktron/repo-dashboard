@@ -233,6 +233,8 @@ footer { margin-top: 26px; font-size: 11.5px; color: var(--ink-3); display: flex
     <button class="chip" id="onlyAction" aria-pressed="false">Needs action only</button>
     <button class="chip" id="onlyAgent" aria-pressed="false"><span class="dot" style="background:var(--serious)"></span>Agent branches</button>
     <span class="spacer"></span>
+    <button id="pullAll" disabled title="Pull every tracked repo, including filtered repos (fast-forward only)">Pull all</button>
+    <button id="pushAll" disabled title="Push every eligible tracked repo, including filtered repos">Push all</button>
     <label class="visually-hidden" for="sort">Sort</label>
     <select id="sort">
       <option value="attention">Sort: attention</option>
@@ -242,6 +244,14 @@ footer { margin-top: 26px; font-size: 11.5px; color: var(--ink-3); display: flex
       <option value="branch">Sort: branch</option>
     </select>
     <button id="expandAll">Expand all</button>
+  </div>
+
+  <div class="notice" id="bulkNotice" hidden>
+    <span id="bulkStatus" role="status" aria-live="polite"></span>
+    <details id="bulkDetails" hidden>
+      <summary>Skipped and failed repos</summary>
+      <ul id="bulkIssues"></ul>
+    </details>
   </div>
 
   <div class="card">
