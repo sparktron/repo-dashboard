@@ -348,6 +348,16 @@ class Classification(unittest.TestCase):
         self.assertIn("no-upstream", self.ids(r))
         self.assertFalse(r["needs_action"])
 
+    def test_idle_main_named_branch_with_local_commits_is_flagged(self):
+        sh(self.work, "branch", "trunk")              # copy of main: exempt
+        sh(self.work, "checkout", "-q", "-b", "develop")
+        sh(self.work, "commit", "-q", "--allow-empty", "-m", "work")
+        sh(self.work, "checkout", "-q", "main")
+        r = self.scan()
+        self.assertEqual([b["name"] for b in r["other_unpushed_branches"]], ["develop"])
+        self.assertIn("side-branch", self.ids(r))
+        self.assertTrue(r["needs_action"])
+
     def test_unreadable_repo_needs_action(self):
         r = scanmod.classify({"name": "x", "path": "/x", "errors": ["status failed: boom"]})
         self.assertEqual(r["status"], "critical")

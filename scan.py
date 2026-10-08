@@ -171,6 +171,12 @@ def parse_remote(url):
 # per-repo scan
 # --------------------------------------------------------------------------
 
+def local_only_count(path, rev):
+    """Commits reachable from `rev` that no remote-tracking ref has."""
+    rc, out, _ = git(path, "rev-list", "--count", rev, "--not", "--remotes")
+    return int(out) if rc == 0 and out.isdigit() else 0
+
+
 def scan_repo(path):
     name = os.path.basename(path.rstrip("/"))
     r = {"name": name, "path": path, "errors": []}
@@ -242,6 +248,12 @@ def scan_repo(path):
             branches.append(b)
             if ahead > 0 or (not up and bname not in MAIN_BRANCHES):
                 unpushed.append(b)
+            elif (not up and r["has_remote"] and bname != r.get("branch")
+                  and local_only_count(path, "refs/heads/" + bname)):
+                # An untracked main-named branch is usually just a local
+                # copy of the remote's -- but only exempt it when that is
+                # true, or commits on an idle `develop` would go unseen.
+                unpushed.append(b)
     r["branches"] = branches
     r["branch_count"] = len(branches)
 
@@ -253,9 +265,7 @@ def scan_repo(path):
     r["local_only_commits"] = 0
     if (r["has_remote"] and r.get("branch") and not r["detached"]
             and r["last_commit"] and (not r.get("upstream") or r["upstream_gone"])):
-        rc, out, _ = git(path, "rev-list", "--count", "HEAD", "--not", "--remotes")
-        if rc == 0 and out.isdigit():
-            r["local_only_commits"] = int(out)
+        r["local_only_commits"] = local_only_count(path, "HEAD")
     agent_b = [b for b in branches if is_agent_branch(b["name"])]
     r["agent_branches"] = agent_b
     r["agent_branch_count"] = len(agent_b)
