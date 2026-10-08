@@ -16,10 +16,11 @@ function data(repos) {
   return { repos, root: "/repos", non_git: [], summary: { counts: {},
     repo_count: repos.length, non_git_count: 0 } };
 }
-async function page(repos, { live = true, confirm = true, post } = {}) {
+async function page(repos, { live = true, confirm = true, post, getRepos } = {}) {
   const elements = new Map();
   const documentEvents = {};
   const requests = [];
+  const repoFetches = [];
   const confirmations = [];
   function element(id) {
     if (!elements.has(id)) elements.set(id, {
@@ -41,7 +42,11 @@ async function page(repos, { live = true, confirm = true, post } = {}) {
     localStorage: { removeItem() {}, setItem() {} },
     setInterval() { return 1; }, clearInterval() {},
     fetch(url, options) {
-      if (url === "/api/repos") return Promise.resolve({ ok: true, json: async () => payload });
+      if (url === "/api/repos") {
+        repoFetches.push(url);
+        const d = getRepos ? getRepos(repoFetches.length, payload) : Promise.resolve(payload);
+        return d.then(x => ({ ok: true, json: async () => x }));
+      }
       const body = JSON.parse(options.body);
       requests.push(body);
       return post ? post(body, requests.length) : Promise.resolve({
@@ -50,7 +55,7 @@ async function page(repos, { live = true, confirm = true, post } = {}) {
     }
   });
   await tick();
-  return { element, requests, confirmations,
+  return { element, requests, confirmations, repoFetches,
     click: id => element(id).events.click(),
     rowClick(repoPath, action) {
       const button = { getAttribute: key => key === "data-path" ? repoPath : action };
@@ -156,4 +161,52 @@ test("static snapshots and empty dashboards cannot run bulk actions", async () =
     await p.click("pushAll");
     assert.equal(p.requests.length, 0);
   }
+});
+
+test("every request carries the upstream the user confirmed", async () => {
+  const p = await page([repo("one"), repo("new", { upstream: null })]);
+  await p.click("pushAll");
+  assert.deepEqual(p.requests.map(r => r.upstream), ["origin/main", null]);
+});
+
+test("a batch cannot start mid-refresh, and refreshes wait out a batch", async () => {
+  let finishRefresh, finishPull;
+  const p = await page([repo("one")], {
+    getRepos: (n, payload) => n === 2
+      ? new Promise(resolve => { finishRefresh = () => resolve(payload); })
+      : Promise.resolve(payload),
+    post: () => new Promise(resolve => { finishPull = resolve; })
+  });
+  p.click("refresh");
+  assert.equal(p.element("pullAll").disabled, true);
+  await p.click("pullAll");
+  assert.equal(p.requests.length, 0);
+  finishRefresh();
+  await tick(); await tick();
+  assert.equal(p.element("pullAll").disabled, false);
+
+  const running = p.click("pullAll");
+  assert.equal(p.requests.length, 1);
+  p.click("refresh");
+  assert.equal(p.repoFetches.length, 2);
+  finishPull({ text: async () => JSON.stringify({ ok: true, output: "done" }) });
+  await running;
+});
+
+test("a slow refresh cannot overwrite the scan a later pull returned", async () => {
+  let finishRefresh;
+  const p = await page([repo("one")], {
+    getRepos: (n, payload) => n === 2
+      ? new Promise(resolve => { finishRefresh = () => resolve(payload); })
+      : Promise.resolve(payload),
+    post: async () => ({ text: async () => JSON.stringify({ ok: true, output: "done",
+      data: data([repo("one", { branch: "after-pull" })]) }) })
+  });
+  p.click("refresh");                      // starts first, will finish last
+  p.rowClick("/repos/one", "pull");
+  for (let i = 0; i < 5; i++) await tick();
+  assert.match(p.element("rows").innerHTML, /after-pull/);
+  finishRefresh();
+  for (let i = 0; i < 5; i++) await tick();
+  assert.match(p.element("rows").innerHTML, /after-pull/);
 });

@@ -205,7 +205,7 @@ class GitEndpoint(unittest.TestCase):
     def post(self, body, headers=None):
         h = {"Content-Type": "application/json", "X-Repodash": "1"}
         h.update(headers or {})
-        body = dict({"branch": "main"}, **body)
+        body = dict({"branch": "main", "upstream": "origin/main"}, **body)
         req = urllib.request.Request(self.url, data=json.dumps(body).encode(),
                                      headers=h, method="POST")
         try:
@@ -268,8 +268,34 @@ class GitEndpoint(unittest.TestCase):
         self.store.refresh()
         repo = self.store.find(str(self.work))
         self.assertFalse(repodash.git_action_args(repo, "pull", "origin", "refs/heads/feat")[0])
-        code, j = self.post({"path": str(self.work), "action": "push", "branch": "feat"})
+        code, j = self.post({"path": str(self.work), "action": "push", "branch": "feat",
+                             "upstream": "origin/feat"})
         self.assertTrue(j["ok"], j["output"])
+
+    def test_upstream_changed_since_confirmation_is_refused(self):
+        sh(self.seed, "push", "-q", "origin", "HEAD:refs/heads/other")
+        sh(self.work, "fetch", "-q")
+        sh(self.work, "commit", "-q", "--allow-empty", "-m", "local")
+        self.store.refresh()                      # the user confirmed origin/main
+        sh(self.work, "branch", "-q", "--set-upstream-to", "origin/other")
+        before = subprocess.run(["git", "ls-remote", "origin"], cwd=self.work,
+                                capture_output=True, text=True, check=True).stdout
+        code, j = self.post({"path": str(self.work), "action": "push"})
+        self.assertFalse(j["ok"])
+        self.assertIn("now tracks origin/other", j["output"])
+        after = subprocess.run(["git", "ls-remote", "origin"], cwd=self.work,
+                               capture_output=True, text=True, check=True).stdout
+        self.assertEqual(before, after)
+
+    def test_request_without_upstream_is_rejected(self):
+        req = urllib.request.Request(
+            self.url, method="POST",
+            data=json.dumps({"path": str(self.work), "action": "pull",
+                             "branch": "main"}).encode(),
+            headers={"Content-Type": "application/json", "X-Repodash": "1"})
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req)
+        self.assertEqual(cm.exception.code, 400)
 
     def test_untracked_path_is_refused(self):
         code, _ = self.post({"path": str(self.seed), "action": "pull"})

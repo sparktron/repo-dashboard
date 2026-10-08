@@ -496,17 +496,32 @@
     if (LIVE && secs > 0) timer = setInterval(refresh, secs * 1000);
   }
 
+  // Every request that returns a scan takes a ticket when it starts; a
+  // response only replaces state.data if no later-started one already has,
+  // so a slow scan can never put back pre-pull/push state.
+  var scanTicket = 0, appliedTicket = 0;
+  function applyScan(ticket, d) {
+    if (ticket < appliedTicket) return false;
+    appliedTicket = ticket; state.data = d;
+    return true;
+  }
+  function gitInFlight() {
+    return !!state.gitBatch || Object.keys(state.gitBusy).length > 0;
+  }
+
   function refresh() {
-    if (!LIVE || state.busy) return;
+    // A pull/push response carries a fresher scan than this would; don't race it.
+    if (!LIVE || state.busy || gitInFlight()) return;
     state.busy = true; render();
     var y = window.scrollY;
+    var ticket = ++scanTicket;
     fetch("/api/repos", { cache: "no-store" })
       .then(function (res) {
         if (!res.ok) throw new Error("server returned " + res.status);
         return res.json();
       })
       .then(function (d) {
-        state.data = d; state.lastError = null; state.busy = false;
+        applyScan(ticket, d); state.lastError = null; state.busy = false;
         render(); window.scrollTo(0, y);
       })
       .catch(function (e) {
@@ -516,7 +531,7 @@
 
   function renderBulkControls() {
     var locked = !LIVE || !state.data || !state.data.repos.length ||
-      !!state.gitBatch || Object.keys(state.gitBusy).length > 0;
+      state.busy || gitInFlight();
     $("pullAll").disabled = locked;
     $("pushAll").disabled = locked;
     var batch = state.gitBatch || state.batchResult;
@@ -547,12 +562,15 @@
   function runGitAction(r, action) {
     var path = r.path;
     state.gitBusy[path] = action; render();
+    var ticket = ++scanTicket;
     return fetch("/api/git", {
       method: "POST",
       cache: "no-store",
       headers: { "Content-Type": "application/json", "X-Repodash": "1" },
-      // The server refuses if the repo has left this branch since the scan.
-      body: JSON.stringify({ path: path, action: action, branch: r.branch })
+      // The server refuses if the repo has left this branch, or its upstream
+      // has changed, since the scan the user confirmed against.
+      body: JSON.stringify({ path: path, action: action, branch: r.branch,
+                             upstream: r.upstream || null })
     })
       .then(function (res) {
         return res.text().then(function (t) {
@@ -563,7 +581,7 @@
         });
       })
       .then(function (j) {
-        if (j.data) state.data = j.data;
+        if (j.data) applyScan(ticket, j.data);
         return { action: action, ok: j.ok, output: j.output };
       }, function (err) {
         return { action: action, ok: false, output: err.message };
@@ -579,7 +597,8 @@
   }
 
   async function gitActionAll(action) {
-    if (!LIVE || !state.data || state.gitBatch || Object.keys(state.gitBusy).length) return;
+    // Not mid-refresh either: the snapshot below must be the newest scan.
+    if (!LIVE || !state.data || state.busy || gitInFlight()) return;
     // Snapshot every repo, including ones hidden by filters. Keep the branches
     // the user saw even when earlier requests return a refreshed scan.
     var repos = state.data.repos.slice();
