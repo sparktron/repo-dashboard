@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -145,14 +146,33 @@ def load_cache():
 
 
 def save_cache(cache):
+    tmp = None
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
-        tmp = CACHE_PATH + ".tmp"
-        with open(tmp, "w") as f:
+        # A unique temp name per write: overlapping refreshes (or `serve`
+        # alongside a cron `export`) must never interleave into one file.
+        fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, prefix="gh.", suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
             json.dump(cache, f)
         os.replace(tmp, CACHE_PATH)
     except OSError:
-        pass  # cache is an optimisation, never a requirement
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        # cache is an optimisation, never a requirement
+
+
+def ci_branch(repo):
+    """The branch CI is looked up for, or None (detached / unborn)."""
+    return None if repo.get("detached") else repo.get("branch")
+
+
+def cache_key(repo):
+    # CI is fetched per branch, so a slug-only key would serve one branch's
+    # run to a checkout of another (after a switch, or two clones).
+    return "%s#%s" % (repo["remote_slug"], ci_branch(repo) or "")
 
 
 def enrich(repos, ttl=DEFAULT_TTL, force=False):
@@ -181,32 +201,36 @@ def enrich(repos, ttl=DEFAULT_TTL, force=False):
     if not status["available"]:
         # Serve stale cache if we have one -- better than an empty column.
         for r in targets:
-            hit = cache.get(r["remote_slug"])
+            hit = cache.get(cache_key(r))
             if hit:
                 r["gh"] = dict(hit, stale=True)
                 r["ci_level"] = ci_level(hit.get("ci"))
         return status
 
     now = time.time()
-    todo, served = [], 0
+    todo, served = {}, 0      # cache key -> repos sharing it (fetched once)
     for r in targets:
-        hit = cache.get(r["remote_slug"])
+        key = cache_key(r)
+        hit = cache.get(key)
         if hit and not force and now - hit.get("fetched_at", 0) < ttl:
             r["gh"] = hit
             r["ci_level"] = ci_level(hit.get("ci"))
             served += 1
         else:
-            todo.append(r)
+            todo.setdefault(key, []).append(r)
 
     if todo:
+        keys = list(todo)
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             results = list(pool.map(
-                lambda r: fetch_repo(r["remote_slug"], r.get("branch")), todo
+                lambda k: fetch_repo(todo[k][0]["remote_slug"], ci_branch(todo[k][0])),
+                keys,
             ))
-        for r, res in zip(todo, results):
-            r["gh"] = res
-            r["ci_level"] = ci_level(res.get("ci"))
-            cache[r["remote_slug"]] = res
+        for key, res in zip(keys, results):
+            for r in todo[key]:
+                r["gh"] = res
+                r["ci_level"] = ci_level(res.get("ci"))
+            cache[key] = res
         save_cache(cache)
 
     status["from_cache"] = served

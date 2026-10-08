@@ -8,19 +8,22 @@
 Stdlib only. Scans are read-only; the only writes are the Pull / Push buttons
 in the live page (fast-forward pull, non-force push), each run on an explicit
 click. Binds loopback by default -- the page exposes local paths and branch
-names, so opening it to the network takes an explicit --host.
+names, so opening it to the network takes an explicit --host. Pull / Push
+only ever answer requests from this machine.
 """
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, urlsplit, parse_qs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -30,8 +33,48 @@ import ghinfo                 # noqa: E402
 
 DEFAULT_ROOT = os.environ.get("REPODASH_ROOT") or os.path.dirname(HERE)
 DEFAULT_PORT = int(os.environ.get("REPODASH_PORT", "8787"))
-ALLOWED_HOSTNAMES = {"localhost", "127.0.0.1", "[::1]", "::1"}
+ALLOWED_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+WILDCARD_HOSTS = ("0.0.0.0", "::", "")
 GIT_ACTION_TIMEOUT = 120
+
+
+def host_hostname(value):
+    """The hostname in a Host/Origin authority, lowercased and without port
+    or IPv6 brackets: "[::1]:8787" -> "::1". None when it can't be parsed."""
+    try:
+        return urlsplit("//" + value).hostname or ""
+    except ValueError:
+        return None
+
+
+def allowed_hostnames(bind_host, extra=()):
+    """Hostnames the Host header may carry. Loopback always; the bind
+    address when it is a specific one; for a wildcard bind, this machine's
+    own names and addresses. Anything else (a VPN name, a reverse proxy)
+    has to be named with --allow-host."""
+    names = set(ALLOWED_HOSTNAMES)
+    names.update(h for h in (host_hostname(x) for x in extra) if h)
+    if bind_host not in WILDCARD_HOSTS:
+        names.add(host_hostname(bind_host) or bind_host)
+        return names
+    try:
+        hn = socket.gethostname()
+        names.update({hn.lower(), socket.getfqdn().lower()})
+        names.update(ai[4][0] for ai in socket.getaddrinfo(hn, None))
+    except OSError:
+        pass
+    try:
+        # The address the default route leaves from (a UDP connect sends nothing).
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 9))
+            names.add(s.getsockname()[0])
+    except OSError:
+        pass
+    return names
+
+
+class ThreadingHTTPServerV6(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
 
 
 def merge_extra(cli_also):
@@ -167,8 +210,13 @@ class Store:
         self.lock = threading.Lock()
         self.data = None
         self.busy_paths = set()   # repos with a pull/push in flight
+        self._started = 0         # refreshes begun
+        self._stored = 0          # sequence number of the scan in self.data
 
     def refresh(self, force_gh=False):
+        with self.lock:
+            self._started += 1
+            seq = self._started
         d = scanmod.scan_all(self.root, extra=self.extra)
         if self.use_gh:
             try:
@@ -179,8 +227,11 @@ class Store:
                                   "reason": "gh enrichment failed: %s" % e}
         else:
             d["gh_status"] = {"available": False, "reason": "disabled with --no-gh."}
+        # Scans overlap (background thread, Refresh, a pull/push). One that
+        # started earlier must not land last and put back pre-push state.
         with self.lock:
-            self.data = d
+            if seq > self._stored:
+                self.data, self._stored = d, seq
         return d
 
     def get(self):
@@ -220,7 +271,9 @@ class Store:
 # http
 # --------------------------------------------------------------------------
 
-def make_handler(store):
+def make_handler(store, allowed_hosts=None):
+    allowed = frozenset(allowed_hosts or ALLOWED_HOSTNAMES)
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "repodash"
         protocol_version = "HTTP/1.1"
@@ -241,10 +294,20 @@ def make_handler(store):
             self.wfile.write(body)
 
         def _host_ok(self):
-            """Reject cross-origin hostnames -- blocks DNS-rebinding at a
-            loopback bind, which is the whole security model here."""
-            host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
-            return host in ALLOWED_HOSTNAMES or host == ""
+            """Reject foreign hostnames -- blocks DNS-rebinding, which is the
+            whole security model here."""
+            host = host_hostname(self.headers.get("Host") or "")
+            return host == "" or host in allowed
+
+        def _client_is_local(self):
+            """Pull/push run as this user on this machine; a page reached
+            over --host is for looking, not for writing."""
+            try:
+                ip = ipaddress.ip_address(self.client_address[0])
+            except ValueError:
+                return False
+            mapped = getattr(ip, "ipv4_mapped", None)
+            return (mapped or ip).is_loopback
 
         def _origin_ok(self):
             """A cross-site page can still aim a POST at loopback with a
@@ -256,11 +319,18 @@ def make_handler(store):
             origin = self.headers.get("Origin")
             if origin is None:
                 return True
-            return (urlparse(origin).hostname or "") in ALLOWED_HOSTNAMES
+            try:
+                return (urlparse(origin).hostname or "") in allowed
+            except ValueError:
+                return False
 
         def do_POST(self):
             if not self._host_ok() or not self._origin_ok():
                 self._send(403, "forbidden\n", "text/plain")
+                return
+            if not self._client_is_local():
+                self._send(403, "pull/push only from the machine running repodash\n",
+                           "text/plain")
                 return
             if urlparse(self.path).path != "/api/git":
                 self._send(404, "not found\n", "text/plain")
@@ -345,14 +415,19 @@ def cmd_serve(args):
                          daemon=True)
     t.start()
 
-    httpd = ThreadingHTTPServer((args.host, args.port), make_handler(store))
-    url = "http://%s:%d/" % (args.host, args.port)
+    allowed = allowed_hostnames(args.host, args.allow_host)
+    server_cls = ThreadingHTTPServerV6 if ":" in args.host else ThreadingHTTPServer
+    httpd = server_cls((args.host, args.port), make_handler(store, allowed))
+    shown = "localhost" if args.host in WILDCARD_HOSTS else args.host
+    url = "http://%s:%d/" % ("[%s]" % shown if ":" in shown else shown, args.port)
     print("[repodash] serving %s  (background rescan every %ds)" % (url, args.interval),
           flush=True)
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         print("[repodash] WARNING: bound to %s -- this page exposes local paths, "
-              "branch names and commit subjects to anyone who can reach it."
-              % args.host, file=sys.stderr)
+              "branch names and commit subjects to anyone who can reach it. "
+              "Pull/Push stay limited to this machine.\n"
+              "[repodash] accepted Host names: %s  (add more with --allow-host)"
+              % (args.host, ", ".join(sorted(allowed))), file=sys.stderr)
     if args.open:
         import webbrowser
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
@@ -443,6 +518,9 @@ def main(argv=None):
 
     sv = sub.add_parser("serve", help="run the live dashboard")
     sv.add_argument("--host", default="127.0.0.1")
+    sv.add_argument("--allow-host", action="append", default=[], metavar="NAME",
+                    help="extra hostname the page may be reached by, e.g. a VPN "
+                         "name (repeatable; only matters with a non-loopback --host)")
     sv.add_argument("--port", type=int, default=DEFAULT_PORT)
     sv.add_argument("--interval", type=int, default=20,
                     help="background rescan interval in seconds (default: %(default)s)")

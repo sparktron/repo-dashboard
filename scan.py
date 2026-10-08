@@ -73,6 +73,7 @@ def parse_status(out):
         "ahead": 0, "behind": 0,
         "staged": 0, "unstaged": 0, "untracked": 0, "conflicts": 0,
         "changed_files": [], "untracked_paths": [],
+        "untracked_noise": 0, "noise_paths": [],
     }
     for line in out.splitlines():
         if line.startswith("# branch.head "):
@@ -93,13 +94,25 @@ def parse_status(out):
             if len(xy) > 1 and xy[1] != ".":
                 st["unstaged"] += 1
             if len(st["changed_files"]) < 12:
-                st["changed_files"].append(line.split("\t")[0].split(" ")[-1])
+                # '1' has 8 fields before the path, '2' has 9 and then
+                # "<path>\t<origPath>". The path itself may contain spaces.
+                nfields = 8 if line[0] == "1" else 9
+                fields = line.split(" ", nfields)
+                if len(fields) > nfields:
+                    st["changed_files"].append(fields[nfields].split("\t")[0])
         elif line.startswith("u "):
             st["conflicts"] += 1
         elif line.startswith("? "):
             st["untracked"] += 1
+            p = line[2:]
             if len(st["untracked_paths"]) < 25:
-                st["untracked_paths"].append(line[2:])
+                st["untracked_paths"].append(p)
+            # Counted over every untracked line, not just the capped sample,
+            # so noise that sorts late is never mistaken for real work.
+            if is_noise_path(p):
+                st["untracked_noise"] += 1
+                if len(st["noise_paths"]) < 25:
+                    st["noise_paths"].append(p)
     st["detached"] = st["branch"] == "(detached)"
     return st
 
@@ -158,6 +171,12 @@ def parse_remote(url):
 # per-repo scan
 # --------------------------------------------------------------------------
 
+def local_only_count(path, rev):
+    """Commits reachable from `rev` that no remote-tracking ref has."""
+    rc, out, _ = git(path, "rev-list", "--count", rev, "--not", "--remotes")
+    return int(out) if rc == 0 and out.isdigit() else 0
+
+
 def scan_repo(path):
     name = os.path.basename(path.rstrip("/"))
     r = {"name": name, "path": path, "errors": []}
@@ -174,10 +193,7 @@ def scan_repo(path):
         return r
     r.update(parse_status(out))
 
-    noise = [p for p in r["untracked_paths"] if is_noise_path(p)]
-    r["untracked_noise"] = len(noise)
-    r["untracked_real"] = r["untracked"] - len(noise)
-    r["noise_paths"] = noise
+    r["untracked_real"] = r["untracked"] - r["untracked_noise"]
     # `dirty` stays literal (any change at all); `dirty_real` is what the
     # attention rules key off, so agent scaffolding never raises an alarm.
     r["dirty"] = bool(r["staged"] or r["unstaged"] or r["untracked"] or r["conflicts"])
@@ -188,6 +204,7 @@ def scan_repo(path):
     r["index_lock"] = stale_lock(gitdir)
 
     # last commit
+    r["last_commit"] = None  # unborn branch / empty repo
     rc, out, _ = git(path, "log", "-1", "--format=%h%x1f%H%x1f%ct%x1f%an%x1f%s")
     if rc == 0 and out:
         f = out.split("\x1f")
@@ -196,8 +213,6 @@ def scan_repo(path):
                 "short": f[0], "hash": f[1], "ts": int(f[2]),
                 "author": f[3], "subject": f[4],
             }
-    else:
-        r["last_commit"] = None  # unborn branch / empty repo
 
     # remotes
     rc, out, _ = git(path, "remote", "get-url", "origin")
@@ -231,10 +246,26 @@ def scan_repo(path):
                 "ts": int(cdate) if cdate.isdigit() else None,
             }
             branches.append(b)
-            if ahead > 0 or (not up and bname not in ("main", "master")):
+            if ahead > 0 or (not up and bname not in MAIN_BRANCHES):
+                unpushed.append(b)
+            elif (not up and r["has_remote"] and bname != r.get("branch")
+                  and local_only_count(path, "refs/heads/" + bname)):
+                # An untracked main-named branch is usually just a local
+                # copy of the remote's -- but only exempt it when that is
+                # true, or commits on an idle `develop` would go unseen.
                 unpushed.append(b)
     r["branches"] = branches
     r["branch_count"] = len(branches)
+
+    # Once the current branch has no live upstream -- never pushed, or its
+    # remote branch was deleted -- git reports no ahead count, so measure
+    # directly: commits reachable from HEAD that no remote-tracking ref has.
+    r["upstream_gone"] = any(b["name"] == r.get("branch") and b["gone"]
+                             for b in branches)
+    r["local_only_commits"] = 0
+    if (r["has_remote"] and r.get("branch") and not r["detached"]
+            and r["last_commit"] and (not r.get("upstream") or r["upstream_gone"])):
+        r["local_only_commits"] = local_only_count(path, "HEAD")
     agent_b = [b for b in branches if is_agent_branch(b["name"])]
     r["agent_branches"] = agent_b
     r["agent_branch_count"] = len(agent_b)
@@ -330,6 +361,13 @@ RULES = [
      lambda r: "diverged from upstream: %d ahead, %d behind" % (r["ahead"], r["behind"])),
     ("unpushed",    "warning",  lambda r: r.get("ahead", 0) > 0,
      lambda r: "%d commit(s) not pushed" % r["ahead"]),
+    # No live upstream, so `ahead` is 0 and says nothing -- these commits
+    # are on no remote at all.
+    ("local-only",  "warning",  lambda r: r.get("local_only_commits", 0) > 0,
+     lambda r: "%d commit(s) on no remote -- %s" % (
+         r["local_only_commits"],
+         "upstream %s was deleted" % r["upstream"] if r.get("upstream_gone")
+         else "branch was never pushed")),
     ("uncommitted", "warning",  lambda r: r.get("dirty_real"),
      lambda r: describe_dirty(r)),
     ("on-agent-branch", "warning", lambda r: r.get("on_agent_branch"),
@@ -349,8 +387,13 @@ RULES = [
                % len(r["other_unpushed_branches"])),
     ("behind",      "info",     lambda r: r.get("behind", 0) > 0,
      lambda r: "%d commit(s) behind upstream" % r["behind"]),
-    ("no-upstream", "info",     lambda r: r.get("has_remote") and not r.get("upstream"),
+    ("no-upstream", "info",     lambda r: r.get("has_remote") and not r.get("upstream")
+        and not r.get("local_only_commits"),
      lambda r: "branch has no upstream -- nothing tracks it"),
+    ("upstream-gone", "info",   lambda r: r.get("upstream_gone")
+        and not r.get("local_only_commits"),
+     lambda r: "upstream %s was deleted on the remote -- every commit is on "
+               "another remote branch" % r["upstream"]),
     ("no-remote",   "info",     lambda r: not r.get("has_remote"),
      lambda r: "no origin remote -- local only"),
     ("stashed",     "info",     lambda r: r.get("stash_count", 0) > 0,
@@ -368,8 +411,8 @@ SEVERITY_ORDER = {"critical": 0, "serious": 1, "warning": 2, "info": 3, "good": 
 
 def describe_dirty(r):
     bits = []
-    for k, label in (("staged", "staged"), ("unstaged", "unstaged"),
-                     ("untracked_real", "untracked")):
+    for k, label in (("conflicts", "conflicted"), ("staged", "staged"),
+                     ("unstaged", "unstaged"), ("untracked_real", "untracked")):
         if r.get(k):
             bits.append("%d %s" % (r[k], label))
     return "uncommitted: " + ", ".join(bits)
@@ -390,6 +433,9 @@ def classify(r):
         r["status"] = "critical"
         r["flags"] = [{"id": "error", "level": "critical", "text": r["errors"][0]}]
         r["headline"] = r["errors"][0]
+        # A repo we cannot read is the most urgent kind of "needs action";
+        # without this it would vanish from the filter and --exit-code.
+        r["needs_action"] = True
         return r
 
     flags = []
@@ -546,7 +592,8 @@ def scan_all(root, extra=None, workers=16):
                 len(r.get("abandoned_agent_branches") or []) for r in repos),
             "repos_with_agent_branches": sum(
                 1 for r in repos if r.get("agent_branch_count")),
-            "unpushed": sum(1 for r in repos if r.get("ahead", 0) > 0),
+            "unpushed": sum(1 for r in repos
+                            if r.get("ahead", 0) > 0 or r.get("local_only_commits", 0) > 0),
             "behind": sum(1 for r in repos if r.get("behind", 0) > 0),
             "no_remote": sum(1 for r in repos if not r.get("has_remote")),
             "with_agent_markers": sum(
