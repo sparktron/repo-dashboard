@@ -94,7 +94,7 @@
       { k: "Uncommitted", v: s.dirty, status: "warning", filter: null,
         title: "Repos with real uncommitted work (agent scaffolding like .claude/ excluded)" },
       { k: "Unpushed", v: s.unpushed, status: "warning", filter: null,
-        title: "Repos with commits ahead of their upstream" },
+        title: "Repos with commits ahead of their upstream, or on no remote at all" },
       { k: "Behind", v: s.behind, status: "info", filter: null,
         title: "Repos behind their upstream" },
       { k: "Clean & synced", v: s.counts.good, status: "good", filter: "good",
@@ -124,8 +124,16 @@
 
   function pushCell(r) {
     if (!r.has_remote) return '<span style="color:var(--ink-3)">no remote</span>';
+    // Without a live upstream git has no ahead count; local_only_commits is
+    // what the scan measured against every remote ref instead.
+    var lo = r.local_only_commits
+      ? ' <b style="color:var(--warning)" title="commits on no remote">↑' +
+        r.local_only_commits + '</b>' : "";
     if (r.upstream === null || r.upstream === undefined)
-      return '<span style="color:var(--serious)">untracked</span>';
+      return '<span style="color:var(--serious)">untracked</span>' + lo;
+    if (upstreamGone(r))
+      return '<span style="color:var(--serious)" title="' + esc(r.upstream) +
+        ' was deleted on the remote">upstream gone</span>' + lo;
     var a = r.ahead || 0, b = r.behind || 0;
     if (!a && !b) return '<span style="color:var(--good)">✓ synced</span>';
     var parts = [];
@@ -325,28 +333,47 @@
     return '<div class="detailbox">' + cols.join("") + '</div>';
   }
 
+  // POSIX single-quoting, so a path with spaces pastes as one argument.
+  function shq(s) {
+    s = String(s);
+    return /^[\w@%+=:,.\/-]+$/.test(s) ? s : "'" + s.replace(/'/g, "'\\''") + "'";
+  }
+
+  // The repo's own main branch -- not every repo calls it `main`.
+  function baseBranch(r) {
+    var have = {};
+    (r.branches || []).forEach(function (b) { have[b.name] = 1; });
+    var mains = ["main", "master", "trunk", "develop"];
+    for (var i = 0; i < mains.length; i++) if (have[mains[i]]) return mains[i];
+    return "main";
+  }
+
   // Commands are shown, never run. Read before pasting.
   function suggestions(r) {
     var ids = (r.flags || []).map(function (f) { return f.id; });
-    var p = r.path, out = [];
-    if (ids.indexOf("stale-lock") !== -1) out.push("rm " + p + "/.git/index.lock");
-    if (ids.indexOf("conflicts") !== -1) out.push("git -C " + p + " status");
-    if (ids.indexOf("operation") !== -1) out.push("git -C " + p + " status   # then --continue or --abort");
-    if (ids.indexOf("detached") !== -1) out.push("git -C " + p + " switch -c rescue/" + r.name);
-    if (ids.indexOf("uncommitted") !== -1) out.push("git -C " + p + " add -A && git -C " + p + " commit");
-    if (ids.indexOf("unpushed") !== -1) out.push("git -C " + p + " push");
-    if (ids.indexOf("on-agent-branch") !== -1)
-      out.push("git -C " + p + " log --oneline main.." + (r.branch || "HEAD") +
+    var has = function (id) { return ids.indexOf(id) !== -1; };
+    var g = "git -C " + shq(r.path), out = [];
+    var br = shq(r.branch || "HEAD");
+    // git_dir, not <path>/.git: in a linked worktree .git is a file.
+    if (has("stale-lock"))
+      out.push("rm " + shq((r.git_dir || r.path + "/.git") + "/index.lock"));
+    if (has("conflicts")) out.push(g + " status");
+    if (has("operation")) out.push(g + " status   # then --continue or --abort");
+    if (has("detached")) out.push(g + " switch -c " + shq("rescue/" + r.name));
+    if (has("uncommitted")) out.push(g + " add -A && " + g + " commit");
+    if (has("unpushed")) out.push(g + " push");
+    if (has("on-agent-branch"))
+      out.push(g + " log --oneline " + shq(baseBranch(r) + ".." + (r.branch || "HEAD")) +
                "   # review, then merge or abandon");
-    if (ids.indexOf("agent-branch-buildup") !== -1)
-      out.push("git -C " + p + " branch --list 'ccode/*' 'claude/*' 'codex/*'" +
+    if (has("agent-branch-buildup"))
+      out.push(g + " branch --list 'ccode/*' 'claude/*' 'codex/*'" +
                "   # review before deleting anything");
-    if (ids.indexOf("agent-scaffolding") !== -1)
-      out.push("echo '.claude/' >> " + p + "/.gitignore");
-    if (ids.indexOf("diverged") !== -1) out.push("git -C " + p + " pull --rebase   # review before pushing");
-    if (ids.indexOf("behind") !== -1) out.push("git -C " + p + " pull --ff-only");
-    if (ids.indexOf("no-upstream") !== -1)
-      out.push("git -C " + p + " push -u origin " + (r.branch || "HEAD"));
+    if (has("agent-scaffolding"))
+      out.push("echo '.claude/' >> " + shq(r.path + "/.gitignore"));
+    if (has("diverged")) out.push(g + " pull --rebase   # review before pushing");
+    if (has("behind")) out.push(g + " pull --ff-only");
+    if (has("no-upstream") || has("local-only"))
+      out.push(g + " push -u origin " + br);
     return out;
   }
 
@@ -448,7 +475,7 @@
     badge.className = "mode-badge " + (LIVE ? "live" : "snapshot") + (state.busy ? " busy" : "");
     $("modeText").textContent = state.lastError ? "error"
       : LIVE ? (state.busy ? "refreshing" : "live") : "snapshot";
-    if (state.lastError) badge.title = state.lastError;
+    badge.title = state.lastError || "";
 
     $("onlyAction").setAttribute("aria-pressed", state.onlyAction);
     $("onlyAgent").setAttribute("aria-pressed", state.onlyAgent);

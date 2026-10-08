@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for extra-repo discovery, Mythos gh skip, and the pull/push endpoint.
+"""Tests for scanning, classification, gh caching, and the HTTP server.
 
     python3 test_scan.py
 """
@@ -10,6 +10,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -279,6 +280,217 @@ class GitEndpoint(unittest.TestCase):
         self.assertEqual(self.post(body, {"X-Repodash": ""})[0], 403)
         self.assertEqual(self.post(body, {"Origin": "https://evil.example"})[0], 403)
         self.assertEqual(self.post(body, {"Origin": "http://127.0.0.1:1"})[0], 200)
+
+
+class Classification(unittest.TestCase):
+    """Repos the dashboard must never call clean."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        t = Path(self.temp.name)
+        self.bare = t / "remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(self.bare)],
+                       check=True)
+        self.work = t / "work"
+        subprocess.run(["git", "clone", "-q", str(self.bare), str(self.work)],
+                       check=True, stderr=subprocess.DEVNULL)
+        sh(self.work, "checkout", "-q", "-b", "main")
+        sh(self.work, "commit", "-q", "--allow-empty", "-m", "one")
+        sh(self.work, "push", "-q", "-u", "origin", "main")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def scan(self):
+        return scanmod.classify(scanmod.scan_repo(str(self.work)))
+
+    def ids(self, r):
+        return [f["id"] for f in r["flags"]]
+
+    def test_deleted_upstream_with_local_commits_needs_action(self):
+        sh(self.work, "checkout", "-q", "-b", "feat")
+        sh(self.work, "commit", "-q", "--allow-empty", "-m", "work")
+        sh(self.work, "push", "-q", "-u", "origin", "feat")
+        sh(self.work, "push", "-q", "origin", ":feat")
+        sh(self.work, "fetch", "-q", "--prune")
+        r = self.scan()
+        self.assertTrue(r["upstream_gone"])
+        self.assertEqual(r["local_only_commits"], 1)
+        self.assertIn("local-only", self.ids(r))
+        self.assertTrue(r["needs_action"])
+        self.assertNotEqual(r["status"], "good")
+
+    def test_deleted_upstream_already_on_another_branch_is_info(self):
+        sh(self.work, "checkout", "-q", "-b", "feat")
+        sh(self.work, "commit", "-q", "--allow-empty", "-m", "work")
+        sh(self.work, "push", "-q", "-u", "origin", "feat")
+        sh(self.work, "push", "-q", "origin", "feat:main")   # merged
+        sh(self.work, "push", "-q", "origin", ":feat")
+        sh(self.work, "fetch", "-q", "--prune")
+        r = self.scan()
+        self.assertEqual(r["local_only_commits"], 0)
+        self.assertIn("upstream-gone", self.ids(r))
+        self.assertFalse(r["needs_action"])
+
+    def test_never_pushed_branch_with_commits_needs_action(self):
+        sh(self.work, "checkout", "-q", "-b", "local")
+        sh(self.work, "commit", "-q", "--allow-empty", "-m", "work")
+        r = self.scan()
+        self.assertEqual(r["local_only_commits"], 1)
+        self.assertIn("local-only", self.ids(r))
+        self.assertNotIn("no-upstream", self.ids(r))
+        self.assertTrue(r["needs_action"])
+
+    def test_never_pushed_branch_without_new_commits_stays_info(self):
+        sh(self.work, "checkout", "-q", "-b", "local")
+        r = self.scan()
+        self.assertEqual(r["local_only_commits"], 0)
+        self.assertIn("no-upstream", self.ids(r))
+        self.assertFalse(r["needs_action"])
+
+    def test_unreadable_repo_needs_action(self):
+        r = scanmod.classify({"name": "x", "path": "/x", "errors": ["status failed: boom"]})
+        self.assertEqual(r["status"], "critical")
+        self.assertTrue(r["needs_action"])
+
+    def test_conflict_only_dirty_text_is_not_empty(self):
+        self.assertEqual(scanmod.describe_dirty({"conflicts": 2}),
+                         "uncommitted: 2 conflicted")
+
+
+class ParseStatus(unittest.TestCase):
+    def test_changed_paths_keep_their_spaces(self):
+        st = scanmod.parse_status(
+            "1 A. N... 000000 100644 100644 0000 abcd my file.txt\n"
+            "2 R. N... 100644 100644 100644 abcd abcd R100 new name.txt\told name.txt\n")
+        self.assertEqual(st["changed_files"], ["my file.txt", "new name.txt"])
+
+    def test_noise_is_counted_past_the_sample_cap(self):
+        lines = ["? f%02d" % i for i in range(30)] + ["? PR_BODY.md"]
+        st = scanmod.parse_status("\n".join(sorted(lines)) + "\n")
+        self.assertEqual(st["untracked"], 31)
+        self.assertEqual(st["untracked_noise"], 1)
+
+
+class HostCheck(unittest.TestCase):
+    def test_host_hostname(self):
+        h = repodash.host_hostname
+        self.assertEqual(h("localhost:8787"), "localhost")
+        self.assertEqual(h("[::1]:8787"), "::1")
+        self.assertEqual(h("[::1]"), "::1")
+        self.assertEqual(h("LocalHost"), "localhost")
+        self.assertEqual(h(""), "")
+        self.assertIsNone(h("[::1"))
+
+    def test_specific_bind_address_is_allowed(self):
+        names = repodash.allowed_hostnames("192.168.1.5", ["box.tail.net"])
+        self.assertTrue({"192.168.1.5", "box.tail.net", "127.0.0.1"} <= names)
+        self.assertEqual(repodash.allowed_hostnames("127.0.0.1"),
+                         set(repodash.ALLOWED_HOSTNAMES) | {"127.0.0.1"})
+
+    def get(self, allowed, host):
+        store = repodash.Store(tempfile.gettempdir(), use_gh=False)
+        store.data = {"repos": []}
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0),
+                                    repodash.make_handler(store, allowed))
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d/healthz" % httpd.server_port,
+                headers={"Host": host})
+            try:
+                with urllib.request.urlopen(req) as res:
+                    return res.status
+            except urllib.error.HTTPError as e:
+                return e.code
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_non_loopback_bind_is_reachable_by_its_address(self):
+        allowed = repodash.allowed_hostnames("192.168.1.5")
+        self.assertEqual(self.get(allowed, "192.168.1.5:8787"), 200)
+        self.assertEqual(self.get(allowed, "[::1]"), 200)
+        self.assertEqual(self.get(allowed, "evil.example:8787"), 403)
+
+    def test_writes_are_refused_from_other_machines(self):
+        H = repodash.make_handler(None)
+        h = H.__new__(H)
+        for addr, local in (("127.0.0.1", True), ("::1", True),
+                            ("::ffff:127.0.0.1", True), ("192.168.1.9", False)):
+            h.client_address = (addr, 1)
+            self.assertEqual(h._client_is_local(), local, addr)
+
+
+class GhCache(unittest.TestCase):
+    def setUp(self):
+        self.saved = {k: getattr(ghinfo, k)
+                      for k in ("gh_status", "fetch_repo", "load_cache", "save_cache")}
+        self.fetched = []
+        ghinfo.gh_status = lambda: {"available": True}
+        ghinfo.load_cache = lambda: dict(self.cache)
+        ghinfo.save_cache = lambda c: None
+
+        def fetch(slug, branch):
+            self.fetched.append((slug, branch))
+            return {"slug": slug, "fetched_at": int(time.time()), "errors": [],
+                    "ci": {"status": "completed", "conclusion": "success",
+                           "branch": branch}}
+        ghinfo.fetch_repo = fetch
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(ghinfo, k, v)
+
+    def repo(self, branch, **over):
+        return dict({"remote_host": "github.com", "remote_slug": "sparktron/x",
+                     "branch": branch, "detached": False}, **over)
+
+    def test_cached_ci_is_not_served_to_another_branch(self):
+        self.cache = {"sparktron/x#main": {"fetched_at": int(time.time()),
+                                           "ci": {"branch": "main"}}}
+        on_main, on_feat = self.repo("main"), self.repo("feat")
+        ghinfo.enrich([on_main, on_feat])
+        self.assertEqual(on_main["gh"]["ci"]["branch"], "main")
+        self.assertEqual(on_feat["gh"]["ci"]["branch"], "feat")
+        self.assertEqual(self.fetched, [("sparktron/x", "feat")])
+
+    def test_same_key_is_fetched_once_and_detached_asks_for_no_branch(self):
+        self.cache = {}
+        a, b = self.repo("main"), self.repo("main")
+        d = self.repo("(detached)", detached=True)
+        ghinfo.enrich([a, b, d])
+        self.assertEqual(sorted(self.fetched, key=str),
+                         sorted([("sparktron/x", "main"), ("sparktron/x", None)], key=str))
+        self.assertIs(a["gh"], b["gh"])
+
+
+class StoreOrdering(unittest.TestCase):
+    def test_older_scan_finishing_last_does_not_win(self):
+        store = repodash.Store(tempfile.gettempdir(), use_gh=False)
+        first_started, release_first = threading.Event(), threading.Event()
+        calls = []
+
+        def fake_scan_all(root, extra=None):
+            n = len(calls)
+            calls.append(n)
+            if n == 0:
+                first_started.set()
+                release_first.wait(5)
+            return {"n": n, "repos": []}
+
+        saved = scanmod.scan_all
+        scanmod.scan_all = fake_scan_all
+        try:
+            t = threading.Thread(target=store.refresh)
+            t.start()
+            first_started.wait(5)
+            store.refresh()             # newer scan lands first
+            release_first.set()
+            t.join(5)
+        finally:
+            scanmod.scan_all = saved
+        self.assertEqual(store.data["n"], 1)
 
 
 if __name__ == "__main__":
