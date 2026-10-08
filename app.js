@@ -13,7 +13,9 @@
     busy: false,
     lastError: null,
     gitBusy: {},     // path -> "pull" | "push" while a click is in flight
-    gitResult: {}    // path -> { action, ok, output, ts } from the last click
+    gitResult: {},   // path -> { action, ok, output, ts } from the last click
+    gitBatch: null,  // current bulk action; also locks individual buttons
+    batchResult: null
   };
 
   var SEV = { critical: 0, serious: 1, warning: 2, info: 3, good: 4 };
@@ -170,7 +172,7 @@
       var why = gitBlock(r, action);
       var text = busy === action ? (action === "pull" ? "Pulling…" : "Pushing…") : label;
       return '<button class="gitbtn" data-git="' + action + '" data-path="' + esc(r.path) + '"' +
-        ((why || busy) ? " disabled" : "") +
+        ((why || busy || state.gitBatch) ? " disabled" : "") +
         ' title="' + esc(why || title) + '">' + text + '</button>';
     }
     var pushTitle = !r.upstream ? "git push -u origin " + (r.branch || "")
@@ -459,6 +461,7 @@
   }
 
   function render() {
+    renderBulkControls();
     if (!state.data) return;
     var d = state.data;
     $("rootpath").textContent = (d.extra && d.extra.length)
@@ -511,15 +514,40 @@
       });
   }
 
+  function renderBulkControls() {
+    var locked = !LIVE || !state.data || !state.data.repos.length ||
+      !!state.gitBatch || Object.keys(state.gitBusy).length > 0;
+    $("pullAll").disabled = locked;
+    $("pushAll").disabled = locked;
+    var batch = state.gitBatch || state.batchResult;
+    $("bulkNotice").hidden = !batch;
+    if (!batch) return;
+    var label = batch.action === "pull" ? "Pull all" : "Push all";
+    $("bulkStatus").textContent = state.gitBatch
+      ? label + ": " + batch.done + "/" + batch.total + " repos processed…"
+      : label + ": " + batch.ok + " succeeded, " + batch.failed + " failed, " +
+        batch.skipped + " skipped (" + batch.total + " repos).";
+    $("bulkDetails").hidden = !batch.issues.length;
+    $("bulkIssues").innerHTML = batch.issues.map(function (issue) {
+      return '<li><b>' + esc(issue.repo.name) + '</b> (' + esc(issue.repo.path) +
+        '): ' + esc(issue.status) + ' — ' + esc(issue.output) + '</li>';
+    }).join("");
+  }
+
   function gitAction(path, action) {
-    if (!LIVE || state.gitBusy[path]) return;
+    if (!LIVE || !state.data || state.gitBatch || state.gitBusy[path]) return;
     var r = state.data.repos.find(function (x) { return x.path === path; });
-    if (!r) return;
+    if (!r || gitBlock(r, action)) return;
     if (action === "push" &&
         !window.confirm("Push " + (r.branch || "HEAD") + " in " + r.name + " to " +
                         (r.upstream || "origin/" + r.branch) + "?")) return;
-    state.gitBusy[path] = action; renderRows();
-    fetch("/api/git", {
+    return runGitAction(r, action);
+  }
+
+  function runGitAction(r, action) {
+    var path = r.path;
+    state.gitBusy[path] = action; render();
+    return fetch("/api/git", {
       method: "POST",
       cache: "no-store",
       headers: { "Content-Type": "application/json", "X-Repodash": "1" },
@@ -546,7 +574,51 @@
         delete state.gitBusy[path];
         if (!res.ok) state.expanded.add(path);
         render();
+        return res;
       });
+  }
+
+  async function gitActionAll(action) {
+    if (!LIVE || !state.data || state.gitBatch || Object.keys(state.gitBusy).length) return;
+    // Snapshot every repo, including ones hidden by filters. Keep the branches
+    // the user saw even when earlier requests return a refreshed scan.
+    var repos = state.data.repos.slice();
+    if (!repos.length) return;
+    var eligible = repos.filter(function (r) { return !gitBlock(r, action); });
+    if (action === "push" && eligible.length && !window.confirm(
+      "Push all: push " + eligible.length + " repos; skip " +
+      (repos.length - eligible.length) + " repos that cannot push.\n\n" +
+      eligible.map(function (r) {
+        return r.name + " (" + r.path + "): " + r.branch + " → " +
+          (r.upstream || "origin/" + r.branch);
+      }).join("\n") + "\n\nContinue?")) return;
+    var batch = { action: action, total: repos.length, done: 0,
+      ok: 0, failed: 0, skipped: 0, issues: [] };
+    state.gitBatch = batch;
+    render();
+    try {
+      for (var r of repos) {
+        var why = gitBlock(r, action);
+        if (why) {
+          batch.skipped++;
+          batch.issues.push({ repo: r, status: "skipped", output: why });
+        } else {
+          // One request at a time; a failure must not prevent later repos.
+          var result = await runGitAction(r, action);
+          if (result.ok) batch.ok++;
+          else {
+            batch.failed++;
+            batch.issues.push({ repo: r, status: "failed", output: result.output });
+          }
+        }
+        batch.done++;
+        renderBulkControls();
+      }
+    } finally {
+      state.batchResult = batch;
+      state.gitBatch = null;
+      render();
+    }
   }
 
   // ---------- events ----------
@@ -607,6 +679,8 @@
   });
   $("sort").addEventListener("change", function () { state.sort = this.value; renderRows(); });
   $("refresh").addEventListener("click", refresh);
+  $("pullAll").addEventListener("click", function () { return gitActionAll("pull"); });
+  $("pushAll").addEventListener("click", function () { return gitActionAll("push"); });
   $("interval").addEventListener("change", scheduleRefresh);
   $("expandAll").addEventListener("click", function () {
     var vis = visibleRepos();
