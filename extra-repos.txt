@@ -1,5 +1,9 @@
 # Git repos (or directories of sibling git repos) scanned in addition to --root.
 # Missing paths are skipped so a machine without the clone stays quiet.
 # Override/extend with --also PATH or REPODASH_ALSO=path:path
-~/mythos
-~/mythos-docs
+#
+# Company (Mythos) checkouts are deliberately NOT listed. This tool runs from a
+# personal-account repository, and its output used to feed the personal Repo
+# Fleet export. Which repositories may appear there is decided by ai-hub's
+# registry domains (scripts/_wscommon.py may_export), not by this file.
+# Add a company tree for a local, one-off look with --also or REPODASH_ALSO.

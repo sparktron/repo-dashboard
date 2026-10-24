@@ -115,9 +115,24 @@ class GhSkip(unittest.TestCase):
 
 class MergeExtra(unittest.TestCase):
     def test_dedupes_also_against_file(self):
-        extras = repodash.merge_extra(["~/mythos"])
-        self.assertEqual(extras.count(os.path.expanduser("~/mythos")), 1)
-        self.assertIn(os.path.expanduser("~/mythos-docs"), extras)
+        # A temporary config, so the test does not depend on what the shipped
+        # extra-repos.txt happens to list (it lists nothing by default).
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "extra-repos.txt"
+            cfg.write_text("~/example-a\n~/example-b\n", encoding="utf-8")
+            original = scanmod.EXTRA_REPOS_FILE
+            scanmod.EXTRA_REPOS_FILE = str(cfg)
+            try:
+                extras = repodash.merge_extra(["~/example-a"])
+            finally:
+                scanmod.EXTRA_REPOS_FILE = original
+        self.assertEqual(extras.count(os.path.expanduser("~/example-a")), 1)
+        self.assertIn(os.path.expanduser("~/example-b"), extras)
+
+    def test_shipped_config_lists_no_company_checkout(self):
+        for path in scanmod.load_extra_repos():
+            name = os.path.basename(os.path.normpath(path)).casefold()
+            self.assertFalse(name.startswith("mythos"), path)
 
 
 def sh(cwd, *args):
