@@ -1,8 +1,8 @@
 # repodash
 
 A live status dashboard for every git repo under `~/repos`, plus extra trees
-listed in `extra-repos.txt` (home-directory clones such as `~/mythos` and
-`~/mythos-docs`). Built to answer one question quickly: **where did an agent
+listed in `extra-repos.txt` (none by default; company checkouts are
+deliberately not listed there, see that file). Built to answer one question quickly: **where did an agent
 leave something unfinished?**
 
 Stdlib Python only — no pip install, no dependencies. Scanning is read-only.
