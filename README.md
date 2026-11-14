@@ -5,11 +5,15 @@ listed in `extra-repos.txt` (none by default; company checkouts are
 deliberately not listed there, see that file). Built to answer one question quickly: **where did an agent
 leave something unfinished?**
 
-Stdlib Python only — no pip install, no dependencies. Scanning is read-only.
+Stdlib Python only — no pip install, no dependencies. The supported runtime is
+POSIX (Linux/macOS), Python 3.10+, and Git 2.34+. Scanning is read-only.
 The only writes are the **Pull** / **Push** buttons on each row of the live
 page, and they run only when you click. Both name the remote and the exact
 branch, so `remote.<name>.push`, `push.default` and push remotes can't widen
-them: Pull is `git pull --ff-only --no-rebase <remote> <ref>`, Push is
+them: Pull fetches the exact upstream, then fast-forwards the confirmed
+checkout under Git's index and prepared reference-transaction locks. It
+refuses divergent history, changed branches/commits, and tracked local changes;
+commit or stash tracked changes before pulling. Push is
 `git push <remote> refs/heads/<branch>:<upstream ref>` (never forced), or
 `git push -u origin <branch>` for a branch with no upstream. Push asks for
 confirmation first. Buttons are disabled when the action can't apply
@@ -62,7 +66,10 @@ on agent work:
 **PR / CI** — optional, via the `gh` CLI. If `gh` is missing or not
 authenticated the columns switch off and a banner says why; nothing else is
 affected. Results are cached in `~/.cache/repodash/gh.json` for 5 minutes
-(`--gh-ttl`). No credentials are read or stored here — auth is entirely `gh`'s.
+(`--gh-ttl`). CI is labeled as the **latest workflow**, not an aggregate of all
+required checks. A successful run is green only when its SHA matches the local
+commit and the cache is not stale. PR counts ending in `+` are limited results.
+No credentials are read or stored here — auth is entirely `gh`'s.
 Disable with `--no-gh`.
 
 ## Reading the dashboard
@@ -87,9 +94,16 @@ Read them before pasting — some are destructive in the wrong repo.
 | `ui.html` / `app.js` | The dashboard. Inlined into one file on export. |
 | `test_scan.py` | Extra-root discovery and Mythos `gh` skip. |
 
+`git_actions.py` implements the protected fast-forward. `processes.py` owns
+command process groups and timeout cleanup. `test_audit.py` contains the audit
+regressions, and `test_app.js` exercises frontend behavior.
+
 ## Automation
 
-`scan --exit-code` exits 1 when any repo needs action, so it drops into cron or
+`scan --exit-code` exits 1 when any repo needs action, with either text or JSON
+output. Discovery failures exit 2 and include structured `errors` in JSON.
+Failed Git queries mark a repository incomplete and block its write actions.
+The command drops into cron or
 a scheduled task:
 
 ```bash
@@ -114,15 +128,40 @@ Refresh the shareable snapshot on a schedule:
   trigger a push: the custom header forces a CORS preflight the server never
   answers. It acts only on paths from the current scan, one action per repo at
   a time. It rescans the repo right before running git and refuses if the
-  branch differs from the one shown on the page. Git runs with
-  `GIT_TERMINAL_PROMPT=0`, no stdin and a 120s timeout so a
-  credential prompt can't hang the server.
+  branch differs from the one shown on the page. When Origin is present it must
+  match the request's scheme, hostname, and port exactly. Git runs without stdin,
+  terminal or graphical credential prompts. Its 120s action deadline terminates
+  the process group, including ordinary hook/transport descendants.
+- Pull locks the checkout's actual index, including in linked worktrees, and
+  prepares a Git ref transaction before updating the working tree. Concurrent
+  checkout/commit cannot redirect the mutation. It never runs a merge or rebase.
+- Remote URL userinfo, query parameters, and fragments are removed from public
+  scan data and exported payloads. Do not put secrets in repository names,
+  commit messages, filenames, or arbitrary hook output: these are still user data.
+- Forced refresh requests require a local client and `X-Repodash: 1` with the
+  same Origin checks as actions. Refresh work is serialized/coalesced and requests
+  have a read deadline. Ordinary reads still expose metadata when binding to the network.
+- HTML and JSON exports each use a unique temporary file and atomic replacement.
+  Concurrent writers cannot interleave either file; the HTML/JSON pair is not a
+  multi-file transaction.
 - All rendered values are HTML-escaped; the export escapes `<` inside the JSON
   payload so repo content can't break out of the `<script>` block.
 - The scanner uses `git --no-optional-locks` and was verified across 7 full
   scans of 39 repos to create zero `index.lock` files.
 
 ## Verification status
+
+For the October 23, 2026 audit fixes, run:
+
+```bash
+python3 -m unittest -v
+node test_app.js
+```
+
+The Python HTTP integration tests need permission to open loopback sockets.
+All mutation fixtures use temporary local bare remotes. See `docs/VALIDATION.md`
+for the current result and unverified environments, and `docs/STATUS.md` for
+remaining work. The following initial implementation checks are historical:
 
 Verified against the real 39 repos in `~/repos`: scan correctness spot-checked
 against raw `git` output, both themes screenshot-reviewed, no console errors, no

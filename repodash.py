@@ -17,9 +17,10 @@ import argparse
 import ipaddress
 import json
 import os
+import shlex
 import socket
-import subprocess
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,9 +31,11 @@ sys.path.insert(0, HERE)
 
 import scan as scanmod        # noqa: E402
 import ghinfo                 # noqa: E402
+import git_actions            # noqa: E402
+import processes              # noqa: E402
 
 DEFAULT_ROOT = os.environ.get("REPODASH_ROOT") or os.path.dirname(HERE)
-DEFAULT_PORT = int(os.environ.get("REPODASH_PORT", "8787"))
+DEFAULT_PORT = os.environ.get("REPODASH_PORT", "8787")
 ALLOWED_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
 WILDCARD_HOSTS = ("0.0.0.0", "::", "")
 GIT_ACTION_TIMEOUT = 120
@@ -125,6 +128,8 @@ def git_action_args(repo, action, remote=None, merge=None):
     other branches or a `+` (forcing) refspec; spelling it out pins the
     push to the one branch the user confirmed, never forced. Pull is
     fast-forward only, so a click can't rewrite history or make a merge."""
+    if repo.get("errors") or repo.get("complete") is False:
+        return None, "scan incomplete -- resolve the scan errors before running git actions"
     if repo.get("operation"):
         return None, "%s in progress -- finish or abort it first" % repo["operation"]
     if repo.get("detached") or not repo.get("branch"):
@@ -145,7 +150,7 @@ def git_action_args(repo, action, remote=None, merge=None):
             if not gone and not repo.get("ahead"):
                 return None, "nothing to push"
             return ["push", "--no-follow-tags", remote, "%s:%s" % (src, merge)], None
-        if repo.get("has_remote"):
+        if repo.get("has_origin", repo.get("has_remote")):
             return ["push", "--no-follow-tags", "-u", "origin", "%s:%s" % (src, src)], None
         return None, "no origin remote to push to"
     return None, "unknown action: %s" % action
@@ -160,19 +165,21 @@ def run_git_action(repo, action):
     args, reason = git_action_args(repo, action, remote, merge)
     if args is None:
         return False, reason
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
-    try:
-        p = subprocess.run(
-            ["git", *args], cwd=repo["path"], env=env,
-            stdin=subprocess.DEVNULL, capture_output=True, text=True,
-            errors="replace", timeout=GIT_ACTION_TIMEOUT, start_new_session=True,
-        )
-    except subprocess.TimeoutExpired:
-        return False, "git %s timed out after %ss" % (" ".join(args), GIT_ACTION_TIMEOUT)
-    except OSError as e:
-        return False, str(e)
-    out = "\n".join(x for x in (p.stdout.strip(), p.stderr.strip()) if x)
-    return p.returncode == 0, "$ git %s\n%s" % (" ".join(args), out or "(no output)")
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="/bin/false",
+               SSH_ASKPASS="/bin/false", SSH_ASKPASS_REQUIRE="never")
+    ssh = env.get("GIT_SSH_COMMAND")
+    if not ssh:
+        rc, configured, err = scanmod.git(repo["path"], "config", "--get", "core.sshCommand")
+        if rc not in (0, 1):
+            return False, scanmod.redact_text("could not read SSH configuration: " + err)
+        ssh = configured if rc == 0 else shlex.quote(env.get("GIT_SSH", "ssh"))
+    env["GIT_SSH_COMMAND"] = ssh + " -oBatchMode=yes"
+    if action == "pull":
+        ok, out = git_actions.fast_forward(repo, remote, merge, GIT_ACTION_TIMEOUT, env)
+        return ok, scanmod.redact_text(out)
+    rc, out, err = processes.run(["git", *args], repo["path"], GIT_ACTION_TIMEOUT, env)
+    output = "\n".join(x for x in (out, err) if x)
+    return rc == 0, scanmod.redact_text("$ git %s\n%s" % (" ".join(args), output or "(no output)"))
 
 
 # --------------------------------------------------------------------------
@@ -187,7 +194,7 @@ def render_page(data=None):
         js = f.read()
 
     if data is not None:
-        payload = json.dumps(data, separators=(",", ":"))
+        payload = json.dumps(scanmod.public_data(data), separators=(",", ":"))
         # </script> inside data would close the tag early; < is safe in JSON.
         payload = payload.replace("<", "\\u003c")
         html = html.replace("/*__DATA__*/null/*__ENDDATA__*/", payload)
@@ -208,16 +215,39 @@ class Store:
         self.use_gh = use_gh
         self.gh_ttl = gh_ttl
         self.lock = threading.Lock()
+        self.refresh_lock = threading.Lock()
         self.data = None
         self.busy_paths = set()   # repos with a pull/push in flight
         self._started = 0         # refreshes begun
         self._stored = 0          # sequence number of the scan in self.data
+        self._last_refresh = 0.0
 
-    def refresh(self, force_gh=False):
+    def refresh(self, force_gh=False, coalesce=False):
+        with self.lock:
+            if coalesce and self.data is not None and time.monotonic() - self._last_refresh < 2:
+                return self.data
+        acquired = self.refresh_lock.acquire(blocking=not coalesce)
+        if not acquired:
+            with self.lock:
+                if self.data is not None:
+                    return self.data
+            # Startup has no cached result yet. Wait for it, without rescanning.
+            with self.refresh_lock:
+                with self.lock:
+                    if self.data is not None:
+                        return self.data
+            return self.refresh(force_gh=force_gh)
+        try:
+            return self._refresh(force_gh)
+        finally:
+            self.refresh_lock.release()
+
+    def _refresh(self, force_gh=False):
         with self.lock:
             self._started += 1
             seq = self._started
         d = scanmod.scan_all(self.root, extra=self.extra)
+        d["scan_id"] = seq
         if self.use_gh:
             try:
                 d["gh_status"] = ghinfo.enrich(d["repos"], ttl=self.gh_ttl,
@@ -227,18 +257,19 @@ class Store:
                                   "reason": "gh enrichment failed: %s" % e}
         else:
             d["gh_status"] = {"available": False, "reason": "disabled with --no-gh."}
-        # Scans overlap (background thread, Refresh, a pull/push). One that
-        # started earlier must not land last and put back pre-push state.
+        # All expensive refreshes are serialized; clients use the generation
+        # to order snapshots independently of HTTP request start/completion.
         with self.lock:
             if seq > self._stored:
                 self.data, self._stored = d, seq
-        return d
+                self._last_refresh = time.monotonic()
+            return self.data
 
     def get(self):
         with self.lock:
             if self.data is not None:
                 return self.data
-        return self.refresh()
+        return self.refresh(coalesce=True)
 
     def find(self, path):
         """A repo from the current scan -- the action endpoint only touches
@@ -262,7 +293,7 @@ class Store:
     def run_background(self, interval, stop):
         while not stop.wait(interval):
             try:
-                self.refresh()
+                self.refresh(coalesce=True)
             except Exception as e:
                 print("[repodash] background refresh failed: %s" % e, file=sys.stderr)
 
@@ -278,6 +309,10 @@ def make_handler(store, allowed_hosts=None):
         server_version = "repodash"
         protocol_version = "HTTP/1.1"
 
+        def setup(self):
+            self.request.settimeout(10)
+            super().setup()
+
         def log_message(self, fmt, *args):
             if os.environ.get("REPODASH_VERBOSE"):
                 super().log_message(fmt, *args)
@@ -290,6 +325,9 @@ def make_handler(store, allowed_hosts=None):
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Connection", "close")
+            self.close_connection = True
             self.end_headers()
             self.wfile.write(body)
 
@@ -320,7 +358,13 @@ def make_handler(store, allowed_hosts=None):
             if origin is None:
                 return True
             try:
-                return (urlparse(origin).hostname or "") in allowed
+                parsed = urlsplit(origin)
+                host = urlsplit("//" + (self.headers.get("Host") or ""))
+                return (parsed.scheme == "http" and parsed.hostname in allowed
+                        and not parsed.username and not parsed.password
+                        and not parsed.path and not parsed.query and not parsed.fragment
+                        and parsed.hostname == host.hostname
+                        and (parsed.port or 80) == (host.port or 80))
             except ValueError:
                 return False
 
@@ -380,11 +424,19 @@ def make_handler(store, allowed_hosts=None):
                            upstream or "no upstream"))
                 else:
                     ok, output = run_git_action(fresh, action)
-                d = store.refresh()
+                try:
+                    d = store.refresh()
+                    refresh_error = None
+                except Exception as exc:
+                    # Git may already have succeeded: never turn that result
+                    # into an ambiguous dropped connection or a retryable failure.
+                    d = None
+                    refresh_error = scanmod.redact_text(str(exc))
             finally:
                 store.release(path)
-            self._send(200, json.dumps({"ok": ok, "action": action,
-                                        "output": output, "data": d}),
+            self._send(200, json.dumps(scanmod.public_data({"ok": ok, "action": action,
+                                        "output": output, "data": d,
+                                        "refresh_error": refresh_error})),
                        "application/json")
 
         def do_GET(self):
@@ -398,10 +450,13 @@ def make_handler(store, allowed_hosts=None):
                 self._send(200, render_page(None), "text/html; charset=utf-8")
             elif u.path == "/api/repos":
                 if q.get("force"):
-                    d = store.refresh(force_gh=bool(q.get("gh")))
+                    if not self._client_is_local() or not self._origin_ok():
+                        self._send(403, "forced scans require a local request with X-Repodash\n", "text/plain")
+                        return
+                    d = store.refresh(force_gh=bool(q.get("gh")), coalesce=True)
                 else:
                     d = store.get()
-                self._send(200, json.dumps(d), "application/json")
+                self._send(200, json.dumps(scanmod.public_data(d)), "application/json")
             elif u.path == "/healthz":
                 self._send(200, "ok\n", "text/plain")
             else:
@@ -450,6 +505,18 @@ def cmd_serve(args):
     return 0
 
 
+def atomic_write(path, content):
+    """Independent writers publish only a fully closed file in the same directory."""
+    fd, tmp = tempfile.mkstemp(prefix=".repodash-", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
 def cmd_export(args):
     extra = merge_extra(args.also)
     store = Store(args.root, extra=extra, use_gh=not args.no_gh, gh_ttl=args.gh_ttl)
@@ -457,17 +524,13 @@ def cmd_export(args):
     html = render_page(d)
     out = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    tmp = out + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(html)
-    os.replace(tmp, out)
+    atomic_write(out, html)
     print("[repodash] wrote %s (%.1f KB, %d repos, %d need action)"
           % (out, os.path.getsize(out) / 1024.0,
              d["summary"]["repo_count"], d["summary"]["needs_action"]))
     if args.json:
         jout = os.path.splitext(out)[0] + ".json"
-        with open(jout, "w", encoding="utf-8") as f:
-            json.dump(d, f, indent=1)
+        atomic_write(jout, json.dumps(scanmod.public_data(d), indent=1))
         print("[repodash] wrote %s" % jout)
     return 0
 
@@ -480,10 +543,11 @@ def cmd_scan(args):
     extra = merge_extra(args.also)
     store = Store(args.root, extra=extra, use_gh=not args.no_gh, gh_ttl=args.gh_ttl)
     d = store.refresh()
+    code = 2 if d.get("errors") else (1 if args.exit_code and d["summary"]["needs_action"] else 0)
     if args.json:
-        json.dump(d, sys.stdout, indent=1)
+        json.dump(scanmod.public_data(d), sys.stdout, indent=1)
         print()
-        return 0
+        return code
 
     color = sys.stdout.isatty() and not args.no_color
     def c(k, s):
@@ -493,6 +557,8 @@ def cmd_scan(args):
     print("%s  %d repos, %d need action  (%.2fs)"
           % (d["root"], s["repo_count"], s["needs_action"], d["scan_seconds"]))
     print("-" * 78)
+    for error in d.get("errors", []):
+        print("scan failed for %s: %s" % (error["path"], error["error"]))
     for r in d["repos"]:
         if args.only_action and not r.get("needs_action"):
             continue
@@ -507,9 +573,28 @@ def cmd_scan(args):
         print("%d dirs not in git%s"
               % (s["non_git_count"],
                  (" — look like projects: " + ", ".join(proj)) if proj else ""))
-    if args.exit_code and s["needs_action"]:
-        return 1
-    return 0
+    return code
+
+
+def positive_int(value):
+    n = int(value)
+    if n <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return n
+
+
+def nonnegative_int(value):
+    n = int(value)
+    if n < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return n
+
+
+def port_number(value):
+    n = int(value)
+    if not 1 <= n <= 65535:
+        raise argparse.ArgumentTypeError("must be between 1 and 65535")
+    return n
 
 
 def main(argv=None):
@@ -521,7 +606,7 @@ def main(argv=None):
                    help="extra git repo, or folder of repos (repeatable)")
     p.add_argument("--no-gh", action="store_true",
                    help="skip the gh CLI entirely (no PR/CI columns)")
-    p.add_argument("--gh-ttl", type=int, default=ghinfo.DEFAULT_TTL,
+    p.add_argument("--gh-ttl", type=nonnegative_int, default=ghinfo.DEFAULT_TTL,
                    help="seconds a cached gh result stays fresh (default: %(default)s)")
     sub = p.add_subparsers(dest="cmd")
 
@@ -530,8 +615,8 @@ def main(argv=None):
     sv.add_argument("--allow-host", action="append", default=[], metavar="NAME",
                     help="extra hostname the page may be reached by, e.g. a VPN "
                          "name (repeatable; only matters with a non-loopback --host)")
-    sv.add_argument("--port", type=int, default=DEFAULT_PORT)
-    sv.add_argument("--interval", type=int, default=20,
+    sv.add_argument("--port", type=port_number, default=DEFAULT_PORT)
+    sv.add_argument("--interval", type=positive_int, default=20,
                     help="background rescan interval in seconds (default: %(default)s)")
     sv.add_argument("--open", action="store_true", help="open a browser")
     sv.set_defaults(func=cmd_serve)
