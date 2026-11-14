@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlsplit, urlunsplit
+
+import processes
 
 GIT_TIMEOUT = 15
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox"}
@@ -42,16 +44,7 @@ def is_noise_path(path):
 
 def run(args, cwd, timeout=GIT_TIMEOUT):
     """Run a command, returning (rc, stdout, stderr). Never raises."""
-    try:
-        p = subprocess.run(
-            args, cwd=cwd, capture_output=True, text=True,
-            timeout=timeout, errors="replace",
-        )
-        return p.returncode, p.stdout.strip(), p.stderr.strip()
-    except subprocess.TimeoutExpired:
-        return 124, "", "timed out after %ss" % timeout
-    except OSError as e:
-        return 127, "", str(e)
+    return processes.run(args, cwd, timeout)
 
 
 def git(cwd, *args, timeout=GIT_TIMEOUT):
@@ -153,14 +146,49 @@ def stale_lock(gitdir):
 # remote parsing
 # --------------------------------------------------------------------------
 
+def redact_url(url):
+    """A display identifier only: never publish URL userinfo/query/fragment."""
+    if "://" not in url:
+        return re.sub(r"^[^/@\s]+@(?=[^/:]+:)", "", url).split("?", 1)[0].split("#", 1)[0]
+    try:
+        u = urlsplit(url)
+        host = u.hostname or ""
+        if ":" in host:
+            host = "[" + host + "]"
+        if u.port:
+            host += ":%d" % u.port
+        return urlunsplit((u.scheme, host, u.path, "", ""))
+    except ValueError:
+        return "(invalid remote URL)"
+
+
+def redact_text(value):
+    return re.sub(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s\"'<>]+",
+                  lambda m: redact_url(m.group()), value)
+
+
+def public_data(value):
+    """Defence at serialization boundaries, including caller-supplied exports."""
+    if isinstance(value, dict):
+        return {k: public_data(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [public_data(v) for v in value]
+    return redact_text(value) if isinstance(value, str) else value
+
+
 def parse_remote(url):
     """Extract (host, owner/name) from an ssh or https remote URL."""
     if not url:
         return None, None
     u = url.strip()
-    m = re.match(r"^(?:ssh://)?(?:[\w.-]+@)?([\w.-]+)[:/](.+?)(?:\.git)?/?$", u)
-    if u.startswith(("http://", "https://")):
-        m = re.match(r"^https?://(?:[^@/]+@)?([\w.-]+)/(.+?)(?:\.git)?/?$", u)
+    if "://" in u:
+        try:
+            parsed = urlsplit(u)
+            slug = parsed.path.strip("/").removesuffix(".git")
+            return parsed.hostname, slug if slug.count("/") == 1 else None
+        except ValueError:
+            return None, None
+    m = re.match(r"^(?:[\w.-]+@)?([\w.-]+)[:/](.+?)(?:\.git)?/?$", u)
     if not m:
         return None, None
     host, slug = m.group(1), m.group(2)
@@ -171,27 +199,41 @@ def parse_remote(url):
 # per-repo scan
 # --------------------------------------------------------------------------
 
-def local_only_count(path, rev):
+def local_only_count(path, rev, errors=None):
     """Commits reachable from `rev` that no remote-tracking ref has."""
-    rc, out, _ = git(path, "rev-list", "--count", rev, "--not", "--remotes")
-    return int(out) if rc == 0 and out.isdigit() else 0
+    rc, out, err = git(path, "rev-list", "--count", rev, "--not", "--remotes")
+    if rc == 0 and out.isdigit():
+        return int(out)
+    if errors is not None:
+        errors.append("local commit count for %s failed: %s" % (rev, redact_text(err) or "invalid output"))
+    return None
 
 
 def scan_repo(path):
     name = os.path.basename(path.rstrip("/"))
-    r = {"name": name, "path": path, "errors": []}
+    r = {"name": name, "path": path, "errors": [], "complete": False}
+
+    def query(*args):
+        rc, out, err = git(path, *args)
+        if rc:
+            r["errors"].append("%s failed: %s" % (args[0], redact_text(err) or "git exited %d" % rc))
+            return None
+        return out
 
     rc, gitdir, err = git(path, "rev-parse", "--absolute-git-dir")
     if rc != 0:
-        r["errors"].append("not a git repo: %s" % (err or "rev-parse failed"))
+        r["errors"].append("not a git repo: %s" % (redact_text(err) or "rev-parse failed"))
         return r
     r["git_dir"] = gitdir
 
     rc, out, err = git(path, "status", "--porcelain=v2", "--branch")
     if rc != 0:
-        r["errors"].append("status failed: %s" % err)
+        r["errors"].append("status failed: %s" % redact_text(err))
         return r
     r.update(parse_status(out))
+    if not r["branch"] or not r["oid"]:
+        r["errors"].append("status failed: missing branch metadata")
+        return r
 
     r["untracked_real"] = r["untracked"] - r["untracked_noise"]
     # `dirty` stays literal (any change at all); `dirty_real` is what the
@@ -205,32 +247,39 @@ def scan_repo(path):
 
     # last commit
     r["last_commit"] = None  # unborn branch / empty repo
-    rc, out, _ = git(path, "log", "-1", "--format=%h%x1f%H%x1f%ct%x1f%an%x1f%s")
-    if rc == 0 and out:
-        f = out.split("\x1f")
-        if len(f) == 5:
+    out = query("log", "-1", "--format=%h%x1f%H%x1f%ct%x1f%an%x1f%s") if r["oid"] != "(initial)" else None
+    if out:
+        f = out.split("\x1f", 4)
+        if len(f) == 5 and f[2].isdigit():
             r["last_commit"] = {
                 "short": f[0], "hash": f[1], "ts": int(f[2]),
                 "author": f[3], "subject": f[4],
             }
+        else:
+            r["errors"].append("log failed: invalid commit metadata")
 
     # remotes
-    rc, out, _ = git(path, "remote", "get-url", "origin")
-    r["remote_url"] = out if rc == 0 and out else None
-    r["has_remote"] = r["remote_url"] is not None
+    remotes = query("remote")
+    names = remotes.splitlines() if remotes is not None else []
+    r["has_origin"] = "origin" in names
+    r["has_remote"] = bool(names) if remotes is not None else None
+    selected = "origin" if r["has_origin"] else next(iter(names), None)
+    out = query("remote", "get-url", selected) if selected else None
+    r["remote_url"] = redact_url(out) if out else None
     r["remote_host"], r["remote_slug"] = parse_remote(r["remote_url"])
 
     # every local branch + its tracking state (catches work parked on a
     # side branch that `status` alone would never show)
-    rc, out, _ = git(
-        path, "for-each-ref", "refs/heads",
+    out = query(
+        "for-each-ref", "refs/heads",
         "--format=%(refname:short)%09%(upstream:short)%09%(upstream:track)%09%(committerdate:unix)",
     )
     branches, unpushed = [], []
-    if rc == 0 and out:
+    if out:
         for line in out.splitlines():
             parts = line.split("\t")
             if len(parts) < 4:
+                r["errors"].append("for-each-ref failed: invalid branch metadata")
                 continue
             bname, up, track, cdate = parts[0], parts[1], parts[2], parts[3]
             ahead = behind = 0
@@ -245,17 +294,16 @@ def scan_repo(path):
                 "ahead": ahead, "behind": behind, "gone": gone,
                 "ts": int(cdate) if cdate.isdigit() else None,
             }
+            b["local_only_commits"] = (
+                local_only_count(path, "refs/heads/" + bname, r["errors"])
+                if r["has_remote"] and (not up or gone) else 0)
             branches.append(b)
-            if ahead > 0 or (not up and bname not in MAIN_BRANCHES):
+            if ahead > 0 or b["local_only_commits"]:
                 unpushed.append(b)
-            elif (not up and r["has_remote"] and bname != r.get("branch")
-                  and local_only_count(path, "refs/heads/" + bname)):
-                # An untracked main-named branch is usually just a local
-                # copy of the remote's -- but only exempt it when that is
-                # true, or commits on an idle `develop` would go unseen.
+            elif not up and not r["has_remote"] and bname not in MAIN_BRANCHES:
                 unpushed.append(b)
     r["branches"] = branches
-    r["branch_count"] = len(branches)
+    r["branch_count"] = len(branches) if out is not None else None
 
     # Once the current branch has no live upstream -- never pushed, or its
     # remote branch was deleted -- git reports no ahead count, so measure
@@ -265,14 +313,15 @@ def scan_repo(path):
     r["local_only_commits"] = 0
     if (r["has_remote"] and r.get("branch") and not r["detached"]
             and r["last_commit"] and (not r.get("upstream") or r["upstream_gone"])):
-        r["local_only_commits"] = local_only_count(path, "HEAD")
+        current = next((b for b in branches if b["name"] == r["branch"]), None)
+        r["local_only_commits"] = current["local_only_commits"] if current else None
     agent_b = [b for b in branches if is_agent_branch(b["name"])]
     r["agent_branches"] = agent_b
     r["agent_branch_count"] = len(agent_b)
     # An agent branch nobody pushed and nobody is on: abandoned session work.
     r["abandoned_agent_branches"] = [
         b for b in agent_b
-        if b["name"] != r.get("branch") and (not b["upstream"] or b["ahead"] > 0)
+        if b["name"] != r.get("branch") and b in unpushed
     ]
     r["unpushed_branches"] = sorted(unpushed, key=lambda b: -b["ahead"])
     # Unpushed work on ordinary branches -- the agent ones are counted above.
@@ -282,13 +331,13 @@ def scan_repo(path):
     ]
 
     # stashes
-    rc, out, _ = git(path, "stash", "list")
-    r["stash_count"] = len([l for l in out.splitlines() if l]) if rc == 0 else 0
+    out = query("stash", "list")
+    r["stash_count"] = len(out.splitlines()) if out is not None else None
 
     # extra worktrees (an agent working in parallel checkouts)
-    rc, out, _ = git(path, "worktree", "list", "--porcelain")
+    out = query("worktree", "list", "--porcelain")
     wts = []
-    if rc == 0:
+    if out is not None:
         cur = {}
         for line in out.splitlines():
             if line.startswith("worktree "):
@@ -330,6 +379,7 @@ def scan_repo(path):
     if not r.get("git_touched_ts"):
         r["git_touched_ts"] = None
 
+    r["complete"] = not r["errors"]
     return r
 
 
@@ -363,7 +413,7 @@ RULES = [
      lambda r: "%d commit(s) not pushed" % r["ahead"]),
     # No live upstream, so `ahead` is 0 and says nothing -- these commits
     # are on no remote at all.
-    ("local-only",  "warning",  lambda r: r.get("local_only_commits", 0) > 0,
+    ("local-only",  "warning",  lambda r: (r.get("local_only_commits") or 0) > 0,
      lambda r: "%d commit(s) on no remote -- %s" % (
          r["local_only_commits"],
          "upstream %s was deleted" % r["upstream"] if r.get("upstream_gone")
@@ -377,6 +427,10 @@ RULES = [
      lambda r: len(r.get("abandoned_agent_branches") or []) >= 5,
      lambda r: "%d abandoned agent branches with unpushed or untracked commits"
                % len(r["abandoned_agent_branches"])),
+    ("agent-unpushed", "warning",
+     lambda r: any(b.get("ahead", 0) > 0 or (b.get("local_only_commits") or 0) > 0
+                   for b in r.get("abandoned_agent_branches", [])),
+     lambda r: "parked agent branch has unpublished commits -- review before abandoning it"),
     ("agent-scaffolding", "info",
      lambda r: r.get("untracked_noise") and not r.get("dirty_real"),
      lambda r: "only agent scaffolding untracked (%s) -- add to .gitignore to silence"
@@ -486,16 +540,25 @@ def load_extra_repos(path=None):
     return extras
 
 
-def discover(root):
+def discover(root, errors=None):
     """Return (git_repo_paths, non_git_dirs) for direct children of root."""
     repos, plain = [], []
     try:
-        entries = sorted(os.scandir(root), key=lambda e: e.name.lower())
+        with os.scandir(root) as iterator:
+            entries = sorted(iterator, key=lambda e: e.name.lower())
     except OSError as e:
-        return [], [{"name": "<root unreadable>", "reason": str(e)}]
+        if errors is not None:
+            errors.append({"path": str(root), "error": str(e)})
+        return [], []
 
     for e in entries:
-        if not e.is_dir(follow_symlinks=False) or e.name.startswith("."):
+        try:
+            directory = e.is_dir(follow_symlinks=False)
+        except OSError as exc:
+            if errors is not None:
+                errors.append({"path": e.path, "error": str(exc)})
+            continue
+        if not directory or e.name.startswith("."):
             continue
         if e.name in SKIP_DIRS:
             continue
@@ -506,7 +569,7 @@ def discover(root):
     return repos, plain
 
 
-def add_scan_target(path, repos, seen):
+def add_scan_target(path, repos, seen, errors=None):
     """Include a git repo, or the git-repo children of a directory.
 
     Missing paths are skipped. Duplicates (by realpath) are skipped so an
@@ -521,7 +584,7 @@ def add_scan_target(path, repos, seen):
             seen.add(real)
             repos.append(path)
         return
-    child_repos, _plain = discover(path)
+    child_repos, _plain = discover(path, errors)
     for child in child_repos:
         real = os.path.realpath(child)
         if real not in seen:
@@ -559,10 +622,11 @@ def describe_plain(path):
 def scan_all(root, extra=None, workers=16):
     started = time.time()
     extra = list(extra or [])
-    repo_paths, plain_paths = discover(root)
+    errors = []
+    repo_paths, plain_paths = discover(root, errors)
     seen = {os.path.realpath(p) for p in repo_paths}
     for path in extra:
-        add_scan_target(path, repo_paths, seen)
+        add_scan_target(path, repo_paths, seen, errors)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         repos = list(pool.map(scan_repo, repo_paths))
@@ -578,6 +642,8 @@ def scan_all(root, extra=None, workers=16):
         "generated_at": int(time.time()),
         "root": root,
         "extra": extra,
+        "errors": errors,
+        "complete": not errors and all(r.get("complete", False) for r in repos),
         "scan_seconds": round(time.time() - started, 2),
         "repos": sorted(repos, key=lambda r: (SEVERITY_ORDER[r["status"]],
                                               r["name"].lower())),
@@ -593,7 +659,8 @@ def scan_all(root, extra=None, workers=16):
             "repos_with_agent_branches": sum(
                 1 for r in repos if r.get("agent_branch_count")),
             "unpushed": sum(1 for r in repos
-                            if r.get("ahead", 0) > 0 or r.get("local_only_commits", 0) > 0),
+                            if r.get("ahead", 0) > 0 or (r.get("local_only_commits") or 0) > 0
+                            or r.get("unpushed_branches")),
             "behind": sum(1 for r in repos if r.get("behind", 0) > 0),
             "no_remote": sum(1 for r in repos if not r.get("has_remote")),
             "with_agent_markers": sum(

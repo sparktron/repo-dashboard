@@ -210,3 +210,60 @@ test("a slow refresh cannot overwrite the scan a later pull returned", async () 
   for (let i = 0; i < 5; i++) await tick();
   assert.match(p.element("rows").innerHTML, /after-pull/);
 });
+
+test("incomplete scans cannot run actions or display synced status", async () => {
+  const p = await page([repo("broken", { complete: false, errors: ["branch query failed"] })]);
+  p.rowClick("/repos/broken", "push");
+  await p.click("pullAll");
+  await p.click("pushAll");
+  assert.equal(p.requests.length, 0);
+  assert.match(p.element("rows").innerHTML, /unknown — scan incomplete/);
+  assert.match(p.element("bulkIssues").innerHTML, /scan incomplete/);
+});
+
+test("root discovery errors remain visible when GitHub enrichment is available", async () => {
+  const p = await page([], { getRepos: async (n, payload) => ({ ...payload,
+    errors: [{ path: "/private", error: "denied" }], gh_status: { available: true } }) });
+  assert.match(p.element("ghNotice").innerHTML, /Scan incomplete/);
+  assert.match(p.element("ghNotice").innerHTML, /denied/);
+});
+
+test("CI identifies its scope and partial GitHub results", async () => {
+  const p = await page([repo("one", { ci_matches_head: false, ci_level: "info",
+    gh: { pr_count: 20, pr_count_limited: true, errors: ["rate limited"], stale: true,
+      ci: { status: "completed", conclusion: "success" } } })]);
+  assert.match(p.element("rows").innerHTML, /20\+ PRs/);
+  assert.match(p.element("rows").innerHTML, /latest workflow: success/);
+  assert.match(p.element("rows").innerHTML, /other or unknown revision/);
+  assert.match(p.element("rows").innerHTML, /cached; stale/);
+  assert.match(p.element("rows").innerHTML, /GitHub data incomplete/);
+});
+
+test("server generations win over HTTP request order for concurrent actions", async () => {
+  let finishFirst;
+  const p = await page([repo("one"), repo("two")], {
+    getRepos: async (n, payload) => ({ ...payload, scan_id: 0 }),
+    post: (body, n) => n === 1 ? new Promise(resolve => { finishFirst = resolve; })
+      : Promise.resolve({ text: async () => JSON.stringify({ ok: true,
+        data: { ...data([repo("older")]), scan_id: 1 } }) })
+  });
+  p.rowClick("/repos/one", "pull");
+  p.rowClick("/repos/two", "pull");
+  for (let i = 0; i < 5; i++) await tick();
+  finishFirst({ text: async () => JSON.stringify({ ok: true,
+    data: { ...data([repo("newest")]), scan_id: 2 } }) });
+  for (let i = 0; i < 5; i++) await tick();
+  assert.match(p.element("rows").innerHTML, /newest/);
+  p.click("refresh");
+  for (let i = 0; i < 5; i++) await tick();
+  assert.match(p.element("rows").innerHTML, /newest/);
+});
+
+test("a successful Git action retains its result when the scan fails", async () => {
+  const p = await page([repo("one")], { post: async () => ({ text: async () =>
+    JSON.stringify({ ok: true, output: "done", data: null, refresh_error: "scan unavailable" }) }) });
+  p.rowClick("/repos/one", "pull");
+  for (let i = 0; i < 5; i++) await tick();
+  assert.match(p.element("rows").innerHTML, /pulled/);
+  assert.equal(p.element("modeText").textContent, "error");
+});

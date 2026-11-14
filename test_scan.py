@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -305,7 +306,44 @@ class GitEndpoint(unittest.TestCase):
         body = {"path": str(self.work), "action": "pull"}
         self.assertEqual(self.post(body, {"X-Repodash": ""})[0], 403)
         self.assertEqual(self.post(body, {"Origin": "https://evil.example"})[0], 403)
-        self.assertEqual(self.post(body, {"Origin": "http://127.0.0.1:1"})[0], 200)
+        self.assertEqual(self.post(body, {"Origin": "http://127.0.0.1:1"})[0], 403)
+        origin = "http://127.0.0.1:%d" % self.httpd.server_port
+        self.assertEqual(self.post(body, {"Origin": origin})[0], 200)
+        self.assertEqual(self.post(body, {"Origin": origin.replace("http:", "https:")})[0], 403)
+
+    def test_forced_scan_requires_local_custom_header(self):
+        url = self.url.replace("/api/git", "/api/repos?force=1&gh=1")
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(url)
+        self.assertEqual(cm.exception.code, 403)
+        req = urllib.request.Request(url, headers={"X-Repodash": "1"})
+        with urllib.request.urlopen(req) as response:
+            self.assertEqual(response.status, 200)
+        with mock.patch.object(self.httpd.RequestHandlerClass, "_client_is_local", return_value=False):
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(req)
+            self.assertEqual(cm.exception.code, 403)
+
+    def test_successful_push_is_reported_when_the_following_scan_fails(self):
+        sh(self.work, "commit", "-q", "--allow-empty", "-m", "local")
+        self.store.refresh()
+        with mock.patch.object(self.store, "refresh", side_effect=OSError("scan unavailable")):
+            code, result = self.post({"path": str(self.work), "action": "push"})
+        self.assertEqual(code, 200)
+        self.assertTrue(result["ok"], result)
+        self.assertIsNone(result["data"])
+        self.assertIn("scan unavailable", result["refresh_error"])
+        self.assertFalse(self.store.busy_paths)
+
+    def test_api_and_action_payloads_redact_remote_secrets(self):
+        secret = "synthetic-api-secret"
+        sh(self.work, "remote", "set-url", "origin", "https://u:%s@example.invalid/org/repo.git" % secret)
+        self.store.refresh()
+        with urllib.request.urlopen(self.url.replace("/api/git", "/api/repos")) as response:
+            self.assertNotIn(secret, response.read().decode())
+        with mock.patch.object(repodash, "run_git_action", return_value=(True, "done")):
+            _, result = self.post({"path": str(self.work), "action": "pull"})
+        self.assertNotIn(secret, json.dumps(result))
 
 
 class Classification(unittest.TestCase):
@@ -502,7 +540,7 @@ class GhCache(unittest.TestCase):
 
 
 class StoreOrdering(unittest.TestCase):
-    def test_older_scan_finishing_last_does_not_win(self):
+    def test_refreshes_are_bounded_and_publish_monotonic_generations(self):
         store = repodash.Store(tempfile.gettempdir(), use_gh=False)
         first_started, release_first = threading.Event(), threading.Event()
         calls = []
@@ -518,15 +556,22 @@ class StoreOrdering(unittest.TestCase):
         saved = scanmod.scan_all
         scanmod.scan_all = fake_scan_all
         try:
-            t = threading.Thread(target=store.refresh)
+            results = []
+            t = threading.Thread(target=lambda: results.append(store.refresh()))
             t.start()
-            first_started.wait(5)
-            store.refresh()             # newer scan lands first
+            self.assertTrue(first_started.wait(5))
+            later = threading.Thread(target=lambda: results.append(store.refresh()))
+            later.start()
+            self.assertEqual(calls, [0])
             release_first.set()
             t.join(5)
+            later.join(5)
+            self.assertFalse(t.is_alive())
+            self.assertFalse(later.is_alive())
         finally:
             scanmod.scan_all = saved
         self.assertEqual(store.data["n"], 1)
+        self.assertEqual(sorted(r["scan_id"] for r in results), [1, 2])
 
 
 if __name__ == "__main__":

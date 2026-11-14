@@ -125,6 +125,8 @@
   }
 
   function pushCell(r) {
+    if (r.complete === false || (r.errors || []).length)
+      return '<span style="color:var(--serious)">unknown — scan incomplete</span>';
     if (!r.has_remote) return '<span style="color:var(--ink-3)">no remote</span>';
     // Without a live upstream git has no ahead count; local_only_commits is
     // what the scan measured against every remote ref instead.
@@ -151,6 +153,7 @@
 
   // Mirrors git_action_args() in repodash.py; the server re-checks anyway.
   function gitBlock(r, action) {
+    if (r.complete === false || (r.errors || []).length) return "scan incomplete";
     if (r.operation) return r.operation + " in progress";
     if (r.detached || !r.branch) return "detached HEAD";
     var gone = upstreamGone(r);
@@ -159,7 +162,7 @@
       if (gone) return "upstream " + r.upstream + " was deleted on the remote";
       return null;
     }
-    if (!r.has_remote) return "no origin remote";
+    if (!r.has_remote || (!r.upstream && r.has_origin === false)) return "no origin remote";
     if (r.upstream && !r.ahead && !gone) return "nothing to push";
     return null;
   }
@@ -192,6 +195,7 @@
   }
 
   function treeCell(r) {
+    if (r.complete === false) return '<span style="color:var(--serious)">scan incomplete</span>';
     if (r.conflicts) return '<b style="color:var(--critical)">' + r.conflicts + ' conflicted</b>';
     var noise = r.untracked_noise
       ? '<span style="color:var(--ink-3)" title="agent scaffolding (' +
@@ -212,14 +216,20 @@
     var bits = [];
     var gh = r.gh;
     if (gh && gh.pr_count) {
-      bits.push('<span class="badge on">' + gh.pr_count + ' PR' +
+      bits.push('<span class="badge on">' + gh.pr_count + (gh.pr_count_limited ? '+' : '') + ' PR' +
                 (gh.pr_count > 1 ? "s" : "") + '</span>');
     }
     if (gh && gh.ci) {
       var lvl = r.ci_level || "info";
       var txt = gh.ci.status === "completed" ? (gh.ci.conclusion || "done") : gh.ci.status;
+      txt = "latest workflow: " + txt;
+      if (!r.ci_matches_head) txt += " (other or unknown revision)";
+      if (gh.stale) txt += " (cached; stale)";
       bits.push('<span class="status s-' + lvl + '" style="font-size:11px">' +
                 '<span class="ico" aria-hidden="true">' + ICON[lvl] + '</span>' + esc(txt) + '</span>');
+    }
+    if (gh && gh.errors && gh.errors.length) {
+      bits.push('<span style="color:var(--serious)" title="' + esc(gh.errors.join('; ')) + '">GitHub data incomplete</span>');
     }
     if (!bits.length) return '<span style="color:var(--ink-3)">—</span>';
     return bits.join(" ");
@@ -252,8 +262,8 @@
     info.push('<li><span class="mono">' + esc(r.path) + '</span></li>');
     if (r.remote_slug) info.push('<li>remote: <span class="mono">' + esc(r.remote_slug) + '</span></li>');
     else if (r.remote_url) info.push('<li>remote: <span class="mono">' + esc(r.remote_url) + '</span></li>');
-    info.push('<li>' + (r.branch_count || 0) + ' local branch(es), ' +
-              (r.stash_count || 0) + ' stash entr(ies)</li>');
+    info.push('<li>' + (r.branch_count == null ? 'unknown' : r.branch_count) + ' local branch(es), ' +
+              (r.stash_count == null ? 'unknown' : r.stash_count) + ' stash entr(ies)</li>');
     if (lc) info.push('<li>last commit ' + esc(clock(lc.ts)) + ' by ' + esc(lc.author) +
                       ' <span class="mono">' + esc(lc.short) + '</span></li>');
     if (r.git_touched_ts) info.push('<li>git last touched this repo ' + esc(age(r.git_touched_ts)) + ' ago</li>');
@@ -269,7 +279,8 @@
     if (ab.length) {
       cols.push('<div><h4>Abandoned agent branches (' + ab.length + ')</h4><ul>' +
         ab.slice(0, 25).map(function (b) {
-          var d = b.upstream ? ("↑" + b.ahead + " unpushed, ↓" + b.behind + " behind")
+          var d = b.gone ? ((b.local_only_commits || 0) + " local-only commits; upstream gone")
+                    : b.upstream ? ("↑" + b.ahead + " unpushed, ↓" + b.behind + " behind")
                              : "never pushed";
           return '<li><span class="mono">' + esc(b.name) + '</span> — ' + esc(d) +
                  (b.ts ? ' <span style="color:var(--ink-3)">(' + esc(age(b.ts)) + ' old)</span>' : "") +
@@ -287,7 +298,8 @@
     });
     if (ub.length) {
       cols.push('<div><h4>Other branches with work</h4><ul>' + ub.map(function (b) {
-        var d = b.upstream ? ("↑" + b.ahead) : "no upstream";
+        var d = b.gone ? ((b.local_only_commits || 0) + " local-only commits; upstream gone")
+                      : b.upstream ? ("↑" + b.ahead) : "no upstream";
         return '<li><span class="mono">' + esc(b.name) + '</span> — ' + esc(d) + '</li>';
       }).join("") + '</ul></div>');
     }
@@ -451,12 +463,15 @@
   function renderGhNotice() {
     var gh = state.data.gh_status;
     var box = $("ghNotice");
-    if (!gh) { box.innerHTML = ""; return; }
+    var errors = state.data.errors || [];
+    var prefix = errors.length ? '<div class="notice warn"><b>Scan incomplete.</b> ' +
+      errors.map(function (e) { return esc(e.path) + ': ' + esc(e.error); }).join('; ') + '</div>' : '';
+    if (!gh) { box.innerHTML = prefix; return; }
     if (gh.available) {
-      box.innerHTML = "";
+      box.innerHTML = prefix;
       return;
     }
-    box.innerHTML = '<div class="notice warn"><b>PR / CI columns are off.</b> ' +
+    box.innerHTML = prefix + '<div class="notice warn"><b>PR / CI columns are off.</b> ' +
       esc(gh.reason) + ' Everything else on this page is unaffected.</div>';
   }
 
@@ -501,8 +516,11 @@
   // so a slow scan can never put back pre-pull/push state.
   var scanTicket = 0, appliedTicket = 0;
   function applyScan(ticket, d) {
-    if (ticket < appliedTicket) return false;
-    appliedTicket = ticket; state.data = d;
+    var current = state.data;
+    if (d.scan_id != null && current && current.scan_id != null) {
+      if (d.scan_id < current.scan_id) return false;
+    } else if (ticket < appliedTicket) return false;
+    appliedTicket = Math.max(appliedTicket, ticket); state.data = d;
     return true;
   }
   function gitInFlight() {
@@ -582,6 +600,7 @@
       })
       .then(function (j) {
         if (j.data) applyScan(ticket, j.data);
+        if (j.refresh_error) state.lastError = "Git finished; scan refresh failed: " + j.refresh_error;
         return { action: action, ok: j.ok, output: j.output };
       }, function (err) {
         return { action: action, ok: false, output: err.message };

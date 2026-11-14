@@ -95,10 +95,11 @@ def fetch_repo(slug, branch):
             "review": p.get("reviewDecision") or None,
         } for p in (prs or [])]
         d["pr_count"] = len(d["prs"])
+        d["pr_count_limited"] = len(d["prs"]) >= 20
 
     run_args = [
         "run", "list", "--repo", slug, "--limit", "1",
-        "--json", "status,conclusion,displayTitle,headBranch,url,createdAt,workflowName",
+        "--json", "status,conclusion,displayTitle,headBranch,headSha,url,createdAt,workflowName",
     ]
     if branch:
         run_args += ["--branch", branch]
@@ -114,6 +115,7 @@ def fetch_repo(slug, branch):
             "conclusion": r.get("conclusion"),    # success|failure|cancelled|...
             "title": r.get("displayTitle"),
             "branch": r.get("headBranch"),
+            "head_sha": r.get("headSha"),
             "workflow": r.get("workflowName"),
             "url": r.get("url"),
             "created_at": r.get("createdAt"),
@@ -140,7 +142,8 @@ def ci_level(ci):
 def load_cache():
     try:
         with open(CACHE_PATH) as f:
-            return json.load(f)
+            value = json.load(f)
+            return value if isinstance(value, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
 
@@ -175,6 +178,24 @@ def cache_key(repo):
     return "%s#%s" % (repo["remote_slug"], ci_branch(repo) or "")
 
 
+def cached_entry(value):
+    if not isinstance(value, dict) or not isinstance(value.get("fetched_at"), (int, float)):
+        return None
+    if value.get("ci") is not None and not isinstance(value["ci"], dict):
+        return None
+    return value
+
+
+def attach(repo, data):
+    repo["gh"] = data
+    ci = data.get("ci")
+    head = (repo.get("last_commit") or {}).get("hash")
+    repo["ci_matches_head"] = bool(ci and head and ci.get("head_sha") == head)
+    repo["ci_level"] = ci_level(ci)
+    if repo["ci_level"] == "good" and (not repo["ci_matches_head"] or data.get("stale")):
+        repo["ci_level"] = "info"
+
+
 def enrich(repos, ttl=DEFAULT_TTL, force=False):
     """Attach a `gh` block to each repo with a github.com remote.
 
@@ -201,20 +222,18 @@ def enrich(repos, ttl=DEFAULT_TTL, force=False):
     if not status["available"]:
         # Serve stale cache if we have one -- better than an empty column.
         for r in targets:
-            hit = cache.get(cache_key(r))
+            hit = cached_entry(cache.get(cache_key(r)))
             if hit:
-                r["gh"] = dict(hit, stale=True)
-                r["ci_level"] = ci_level(hit.get("ci"))
+                attach(r, dict(hit, stale=True))
         return status
 
     now = time.time()
     todo, served = {}, 0      # cache key -> repos sharing it (fetched once)
     for r in targets:
         key = cache_key(r)
-        hit = cache.get(key)
+        hit = cached_entry(cache.get(key))
         if hit and not force and now - hit.get("fetched_at", 0) < ttl:
-            r["gh"] = hit
-            r["ci_level"] = ci_level(hit.get("ci"))
+            attach(r, hit)
             served += 1
         else:
             todo.setdefault(key, []).append(r)
@@ -228,8 +247,7 @@ def enrich(repos, ttl=DEFAULT_TTL, force=False):
             ))
         for key, res in zip(keys, results):
             for r in todo[key]:
-                r["gh"] = res
-                r["ci_level"] = ci_level(res.get("ci"))
+                attach(r, res)
             cache[key] = res
         save_cache(cache)
 
